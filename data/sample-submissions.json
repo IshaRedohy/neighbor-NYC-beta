@@ -1,0 +1,25 @@
+{
+  "submissions": [
+    {
+      "version": 1,
+      "formId": "local-sample",
+      "responseId": "sample-jordan-001",
+      "email": "jordan@example.com",
+      "consent": true,
+      "adult": true,
+      "profile": {
+        "name": "Jordan Ellis",
+        "zip": "11372",
+        "occupation": "Community gardener",
+        "workplace": "Fictional demo profile",
+        "bio": "A fictional submission for testing the import and approval flow. Happy to share gardening tips and meet neighbors.",
+        "languages": ["English", "Spanish"],
+        "expertise": ["gardening", "local resources"],
+        "interests": ["food", "volunteering"],
+        "needs": ["web development"],
+        "cultures": [],
+        "countries": []
+      }
+    }
+  ]
+}

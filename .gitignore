@@ -1,0 +1,13 @@
+node_modules/
+.next/
+.env
+.env.*
+!.env.example
+*.tsbuildinfo
+backups/
+test-results/
+.venv/
+.venv-py39-backup-*/
+__pycache__/
+*.pyc
+.pytest_cache/
