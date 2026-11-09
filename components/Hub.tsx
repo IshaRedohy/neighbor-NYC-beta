@@ -36,6 +36,8 @@ import {
 import { api, post, initials, title } from "@/lib/client";
 import type { Member, Profile } from "@/lib/types";
 
+import LinkLogin from "@/components/LinkLogin";
+import Inbox from "@/components/Inbox";
 import Community from "@/components/Community";
 
 function Logo() {
@@ -85,6 +87,7 @@ export default function Hub() {
     demo: boolean;
     google: boolean;
     formUrl: string | null;
+    nativeSignup?: boolean;
   }>({ demo: false, google: false, formUrl: null });
   const [communityProfile, setCommunityProfile] = useState<Profile | null>(
     null,
@@ -97,7 +100,8 @@ export default function Hub() {
   const refresh = useCallback(async () => {
     try {
       setMe(await api("/me"));
-    } catch {
+    } catch (e) {
+      if ((e as any).status !== 401) setError((e as Error).message);
       setMe(null);
     } finally {
       setLoading(false);
@@ -111,23 +115,52 @@ export default function Hub() {
   }, [refresh]);
   useEffect(() => {
     if (!me) return;
-    const update = () =>
-      api<any[]>("/conversations")
-        .then((rows) => setUnread(rows.reduce((n, r) => n + r.unread, 0)))
-        .catch(() => {});
-    update();
-    const updateEvents = () =>
-      api("/notifications")
-        .then((n) => setEventCount(n.count))
-        .catch(() => {});
-    updateEvents();
-    const eventTimer = setInterval(updateEvents, 10000);
-    const timer = setInterval(update, 10000);
-    return () => {
-      clearInterval(timer);
-      clearInterval(eventTimer);
+    let active = true,
+      pending = false;
+    const update = async () => {
+      if (document.hidden || pending) return;
+      pending = true;
+      try {
+        const jobs = [
+          api("/notifications").then((n) => {
+            if (active) setEventCount(n.count);
+          }),
+        ];
+        if (path !== "/messages")
+          jobs.push(
+            api("/inbox-summary").then((n) => {
+              if (active) setUnread(n.unread);
+            }),
+          );
+        await Promise.all(jobs);
+      } catch {
+      } finally {
+        pending = false;
+      }
     };
-  }, [me]);
+    const summary = (event: Event) => setUnread((event as CustomEvent).detail);
+    const visible = () => {
+      if (!document.hidden) void update();
+    };
+    void update();
+    const timer = setInterval(update, 30000);
+    document.addEventListener("visibilitychange", visible);
+    window.addEventListener("inbox-summary", summary);
+    return () => {
+      active = false;
+      clearInterval(timer);
+      document.removeEventListener("visibilitychange", visible);
+      window.removeEventListener("inbox-summary", summary);
+    };
+  }, [me, path]);
+  useEffect(() => {
+    const expired = () => {
+      setMe(null);
+      setError("Your session expired. Sign in again to continue.");
+    };
+    window.addEventListener("session-expired", expired);
+    return () => window.removeEventListener("session-expired", expired);
+  }, []);
   async function logout() {
     try {
       await post("/auth/logout");
@@ -247,16 +280,28 @@ function Landing({
   onLogin,
   initialError,
 }: {
-  config: { demo: boolean; google: boolean; formUrl: string | null };
+  config: {
+    demo: boolean;
+    google: boolean;
+    formUrl: string | null;
+    nativeSignup?: boolean;
+  };
   onLogin: () => Promise<void>;
   initialError: string;
 }) {
+  const [accessState, setAccessState] = useState("");
   const [error, setError] = useState(initialError),
     [busy, setBusy] = useState(false);
   useEffect(() => {
     const e = new URLSearchParams(window.location.search).get("error");
     if (e) setError(e);
+    setAccessState(
+      new URLSearchParams(window.location.search).get("status") || "",
+    );
   }, []);
+  useEffect(() => {
+    if (initialError) setError(initialError);
+  }, [initialError]);
   async function demo(email: string) {
     setBusy(true);
     try {
@@ -291,13 +336,21 @@ function Landing({
           corner. Find the New Yorkers who make this city feel like home.
         </p>
         <div className="landing-actions">
-          <a className="button primary" href="/api/auth/google">
-            Continue with Google <ArrowRight size={18} />
+          <a
+            className="button primary"
+            href={
+              config.nativeSignup ? "/api/auth/cognito" : "/api/auth/google"
+            }
+          >
+            {config.nativeSignup
+              ? "Google or email code"
+              : "Continue with Google"}{" "}
+            <ArrowRight size={18} />
           </a>
-          {config.formUrl && (
+          {(config.nativeSignup || config.formUrl) && (
             <a
               className="button secondary"
-              href={config.formUrl}
+              href={config.nativeSignup ? "/signup" : config.formUrl!}
               target="_blank"
               rel="noreferrer"
             >
@@ -309,7 +362,40 @@ function Landing({
           Your email is private to you and the community host for sign-in and
           approval. No phone number or exact address required.
         </p>
+        {accessState && (
+          <section className="panel" role="status">
+            <h2>
+              {{
+                pending: "Awaiting host approval",
+                wrong_account: "Check your Google account",
+                suspended: "Membership suspended",
+                temporary: "Please try again shortly",
+                expired: "Start sign-in again",
+              }[accessState] || "Sign-in needs attention"}
+            </h2>
+            <p>
+              {
+                {
+                  pending:
+                    "Your submission is waiting for review. Your host will share an invitation after approval.",
+                  wrong_account:
+                    "Choose the Google account whose email you entered on the form. If you just submitted, ask your host to import and approve it.",
+                  suspended:
+                    "Contact your community host to discuss restoring access.",
+                  temporary:
+                    "The service is temporarily unavailable. Your profile has not changed.",
+                  expired:
+                    "Your sign-in session expired. Use the sign-in button above to try again.",
+                }[accessState]
+              }
+            </p>
+          </section>
+        )}
         <ErrorNote error={error} />
+        <p className="quiet">
+          Submit the form → host imports and approves → receive your invitation
+          → sign in with that Google account.
+        </p>
         <div className="landing-values">
           <span>
             <ShieldCheck /> Members, not strangers
@@ -381,12 +467,25 @@ function Cityscape() {
 }
 
 function Discover({ me, formUrl }: { me: Member; formUrl: string | null }) {
+  const [mode, setMode] = useState("recommended"),
+    [zip, setZip] = useState(""),
+    [neighborhood, setNeighborhood] = useState(""),
+    [occupation, setOccupation] = useState(""),
+    [specialty, setSpecialty] = useState(""),
+    [help, setHelp] = useState("");
+  const [sharedCulture, setSharedCulture] = useState(false),
+    [preferenceVersion, setPreferenceVersion] = useState(0);
+  useEffect(() => {
+    api("/preferences")
+      .then((p) => setSharedCulture(p.sharedCulture))
+      .catch(() => {});
+  }, []);
   const [q, setQ] = useState(""),
     [language, setLanguage] = useState(""),
     [culture, setCulture] = useState(""),
     [country, setCountry] = useState(""),
     [interest, setInterest] = useState(""),
-    [radius, setRadius] = useState("5"),
+    [radius, setRadius] = useState("all"),
     [page, setPage] = useState(1);
   const [data, setData] = useState<any>(null),
     [loading, setLoading] = useState(true),
@@ -398,6 +497,12 @@ function Discover({ me, formUrl }: { me: Member; formUrl: string | null }) {
     setLoading(true);
     const timer = setTimeout(() => {
       const params = new URLSearchParams({
+        mode,
+        zip,
+        neighborhood,
+        occupation,
+        specialty,
+        help,
         q,
         language,
         culture,
@@ -422,14 +527,35 @@ function Discover({ me, formUrl }: { me: Member; formUrl: string | null }) {
       clearTimeout(timer);
       controller.abort();
     };
-  }, [q, language, culture, country, interest, radius, page]);
+  }, [
+    q,
+    language,
+    culture,
+    country,
+    interest,
+    radius,
+    page,
+    mode,
+    zip,
+    neighborhood,
+    occupation,
+    specialty,
+    help,
+    preferenceVersion,
+  ]);
   function reset() {
     setQ("");
     setLanguage("");
     setCulture("");
     setCountry("");
     setInterest("");
-    setRadius("5");
+    setRadius("all");
+    setZip("");
+    setNeighborhood("");
+    setOccupation("");
+    setSpecialty("");
+    setHelp("");
+    setMode("recommended");
     setPage(1);
   }
   return (
@@ -477,6 +603,98 @@ function Discover({ me, formUrl }: { me: Member; formUrl: string | null }) {
               {me.neighborhood} <span>· {me.zip}</span>
             </span>
           </div>
+          <div className="filter-row" aria-label="Recommendation sections">
+            {[
+              ["recommended", "Recommended connections"],
+              ["nearby", "People nearby"],
+              ["help_me", "People who can help me"],
+              ["i_can_help", "People I could help"],
+              ["shared", "Shared interests and occupations"],
+            ].map(([value, label]) => (
+              <button
+                key={value}
+                className={`filter-select ${mode === value ? "selected" : ""}`}
+                onClick={() => {
+                  setMode(value);
+                  setPage(1);
+                }}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+          <div className="filter-row">
+            {[
+              ["ZIP", zip, setZip, data?.filters.zips],
+              [
+                "Neighborhood",
+                neighborhood,
+                setNeighborhood,
+                data?.filters.neighborhoods,
+              ],
+              [
+                "Occupation",
+                occupation,
+                setOccupation,
+                data?.filters.occupations,
+              ],
+              ["Skills", specialty, setSpecialty, data?.filters.specialties],
+            ].map(([label, value, setter, options]: any) => (
+              <label className="filter-select" key={label}>
+                <select
+                  aria-label={label}
+                  value={value}
+                  onChange={(e) => {
+                    setter(e.target.value);
+                    setPage(1);
+                  }}
+                >
+                  <option value="">Any {label.toLowerCase()}</option>
+                  {options?.map((v: string) => (
+                    <option key={v}>{v}</option>
+                  ))}
+                </select>
+              </label>
+            ))}
+            <label className="filter-select">
+              <select
+                aria-label="Help direction"
+                value={help}
+                onChange={(e) => {
+                  setHelp(e.target.value);
+                  setPage(1);
+                }}
+              >
+                <option value="">Any help direction</option>
+                <option value="receive">Can help me</option>
+                <option value="give">I can help</option>
+                <option value="both">Help each other</option>
+              </select>
+            </label>
+          </div>
+          <label className="preference">
+            <input
+              type="checkbox"
+              checked={sharedCulture}
+              onChange={async (e) => {
+                const value = e.target.checked;
+                try {
+                  await api("/preferences", {
+                    method: "PUT",
+                    body: JSON.stringify({ sharedCulture: value }),
+                  });
+                  setSharedCulture(value);
+                  setPreferenceVersion((v) => v + 1);
+                } catch (e) {
+                  setError((e as Error).message);
+                }
+              }}
+            />{" "}
+            Prefer shared culture when other matches are equal
+          </label>
+          <p className="quiet">
+            Distance uses ZIP centers. Neighborhood labels are approximate.
+          </p>
           <div className="search-box">
             <Search size={20} />
             <input
@@ -809,6 +1027,7 @@ function ProfileModal({
     [reported, setReported] = useState(false);
   const router = useRouter();
   const dialog = useRef<HTMLElement>(null);
+  const requestKey = useRef<{ body: string; id: string } | null>(null);
   useEffect(() => {
     const previous = document.activeElement as HTMLElement;
     dialog.current?.querySelector<HTMLElement>("button")?.focus();
@@ -843,7 +1062,13 @@ function ProfileModal({
     e.preventDefault();
     setBusy(true);
     try {
-      const c = await post("/conversations", { recipientId: p.id, body: text });
+      if (!requestKey.current || requestKey.current.body !== text)
+        requestKey.current = { body: text, id: crypto.randomUUID() };
+      const c = await post("/conversations", {
+        clientMessageId: requestKey.current.id,
+        recipientId: p.id,
+        body: text,
+      });
       router.push("/messages?conversation=" + c.id);
       onClose();
     } catch (e) {
@@ -995,279 +1220,6 @@ function ProfileModal({
   );
 }
 
-function Inbox({ me }: { me: Member }) {
-  const [threads, setThreads] = useState<any[]>([]),
-    [selected, setSelected] = useState(""),
-    [data, setData] = useState<any>(null),
-    [text, setText] = useState(""),
-    [error, setError] = useState(""),
-    [busy, setBusy] = useState(false);
-  const selectedRef = useRef("");
-  const pendingRequest = useRef<AbortController | null>(null);
-  const selectConversation = useCallback((id: string) => {
-    pendingRequest.current?.abort();
-    selectedRef.current = id;
-    setSelected(id);
-    setData(null);
-    setText("");
-    setError("");
-  }, []);
-  useEffect(() => {
-    selectConversation(
-      new URLSearchParams(window.location.search).get("conversation") || "",
-    );
-  }, [selectConversation]);
-  const refresh = useCallback(async () => {
-    // A completed send/decision may belong to a conversation already left.
-    if (selectedRef.current !== selected) return;
-    pendingRequest.current?.abort();
-    const controller = new AbortController();
-    pendingRequest.current = controller;
-    const current = () =>
-      !controller.signal.aborted && selectedRef.current === selected;
-    try {
-      const threads = await api<any[]>("/conversations", {
-        signal: controller.signal,
-      });
-      if (!current()) return;
-      setThreads(threads);
-      if (selected) {
-        if (!threads.some((thread) => thread.id === selected)) {
-          selectConversation("");
-          return;
-        }
-        const messages = await api("/conversations/" + selected + "/messages", {
-          signal: controller.signal,
-        });
-        if (!current()) return;
-        setData(messages);
-        await post("/conversations/" + selected + "/read");
-      }
-      if (current()) setError("");
-    } catch (e) {
-      if (current()) {
-        setData(null);
-        setError((e as Error).message);
-      }
-    } finally {
-      if (pendingRequest.current === controller) pendingRequest.current = null;
-    }
-  }, [selected, selectConversation]);
-  useEffect(() => {
-    refresh();
-    const timer = setInterval(() => {
-      if (!pendingRequest.current) refresh();
-    }, 5000);
-    return () => {
-      clearInterval(timer);
-      pendingRequest.current?.abort();
-    };
-  }, [refresh]);
-  const other = threads.find((t) => t.id === selected);
-  async function send(e: FormEvent) {
-    e.preventDefault();
-    setBusy(true);
-    try {
-      await post(`/conversations/${selected}/messages`, { body: text });
-      if (selectedRef.current === selected) setText("");
-      await refresh();
-    } catch (e) {
-      if (selectedRef.current === selected) setError((e as Error).message);
-    } finally {
-      setBusy(false);
-    }
-  }
-  async function decision(action: string) {
-    try {
-      await post(`/conversations/${selected}/decision`, { action });
-      await refresh();
-    } catch (e) {
-      if (selectedRef.current === selected) setError((e as Error).message);
-    }
-  }
-  return (
-    <>
-      <div className="page-heading">
-        <div className="eyebrow">ONE CONVERSATION AT A TIME</div>
-        <h1>
-          Your conversations<span className="green-text">.</span>
-        </h1>
-        <p>A thoughtful hello can go a long way.</p>
-      </div>
-      <ErrorNote error={error} />
-      <div className="inbox">
-        <aside className="thread-list">
-          <div className="thread-title">
-            <h3>Messages</h3>
-            <span>{threads.length}</span>
-          </div>
-          {threads.length === 0 ? (
-            <div className="quiet padded">
-              No conversations yet. Find a neighbor and say hello.
-            </div>
-          ) : (
-            threads.map((t) => (
-              <button
-                className={`thread ${selected === t.id ? "selected" : ""}`}
-                key={t.id}
-                onClick={() => {
-                  selectConversation(t.id);
-                }}
-              >
-                <Avatar name={t.other_name} size="small" />
-                <span>
-                  <strong>{t.other_name}</strong>
-                  <small>
-                    {t.status === "pending"
-                      ? "Message request"
-                      : t.status === "declined"
-                        ? "Request declined"
-                        : t.last_message}
-                  </small>
-                </span>
-                {t.unread > 0 && <i className="unread-dot" />}
-              </button>
-            ))
-          )}
-        </aside>
-        <section className="chat">
-          {!selected ? (
-            <Empty
-              title="Make room for a new connection"
-              text="Choose a conversation or find someone in Discover."
-            />
-          ) : data?.conversation.id === selected && other ? (
-            <>
-              <header className="chat-heading">
-                <Avatar name={other.other_name} size="small" />
-                <div>
-                  <h3>{other.other_name}</h3>
-                  <span>
-                    {data.conversation.status === "accepted"
-                      ? "Your conversation"
-                      : "Message request"}
-                  </span>
-                </div>
-                <button
-                  className="icon-button"
-                  aria-label="Block this member"
-                  onClick={async () => {
-                    if (
-                      window.confirm(
-                        "Block this member and hide this conversation?",
-                      )
-                    ) {
-                      try {
-                        await post("/blocks/" + other.other_id);
-                        selectConversation("");
-                      } catch (e) {
-                        setError((e as Error).message);
-                      }
-                    }
-                  }}
-                >
-                  <Ban size={17} />
-                </button>
-                <button
-                  className="icon-button"
-                  aria-label="Report this member"
-                  onClick={async () => {
-                    const reason = window.prompt(
-                      "Briefly describe what happened (at least 5 characters).",
-                    );
-                    if (reason)
-                      try {
-                        await post("/reports", {
-                          memberId: other.other_id,
-                          reason,
-                        });
-                        setError("Report sent to your community host.");
-                      } catch (e) {
-                        setError((e as Error).message);
-                      }
-                  }}
-                >
-                  <Flag size={17} />
-                </button>
-              </header>
-              <div className="message-list">
-                {data.messages.map((m: any) => (
-                  <div
-                    className={`message ${m.sender_id === me.id ? "mine" : ""}`}
-                    key={m.id}
-                  >
-                    <p>{m.body}</p>
-                    <time>
-                      {new Date(m.created_at).toLocaleString([], {
-                        month: "short",
-                        day: "numeric",
-                        hour: "numeric",
-                        minute: "2-digit",
-                      })}
-                    </time>
-                  </div>
-                ))}
-              </div>
-              {data.conversation.status === "pending" ? (
-                <div className="request-banner">
-                  {data.conversation.recipient_id === me.id ? (
-                    <>
-                      <p>Would you like to start a conversation?</p>
-                      <button
-                        className="button primary"
-                        onClick={() => decision("accept")}
-                      >
-                        Accept request <Check size={16} />
-                      </button>
-                      <button
-                        className="button secondary"
-                        onClick={() => decision("decline")}
-                      >
-                        Decline
-                      </button>
-                    </>
-                  ) : (
-                    <p>
-                      Your hello is on its way. You can continue once your
-                      neighbor accepts.
-                    </p>
-                  )}
-                </div>
-              ) : data.conversation.status === "declined" ||
-                other.other_status !== "approved" ? (
-                <div className="request-banner">
-                  This conversation is closed.
-                </div>
-              ) : (
-                <form className="message-composer" onSubmit={send}>
-                  <textarea
-                    required
-                    maxLength={2000}
-                    value={text}
-                    onChange={(e) => setText(e.target.value)}
-                    aria-label="Your message"
-                    disabled={busy}
-                    placeholder="Write a thoughtful reply…"
-                  />
-                  <button
-                    className="button primary"
-                    disabled={busy || !text.trim()}
-                    aria-label="Send message"
-                  >
-                    <Send size={18} />
-                  </button>
-                </form>
-              )}
-            </>
-          ) : (
-            <p className="padded">Loading conversation…</p>
-          )}
-        </section>
-      </div>
-    </>
-  );
-}
-
 function EditProfile({
   me,
   refresh,
@@ -1277,6 +1229,15 @@ function EditProfile({
   refresh: () => Promise<void>;
   logout: () => Promise<void>;
 }) {
+  const [suggestions, setSuggestions] = useState<{
+    occupations: string[];
+    skills: string[];
+  }>({ occupations: [], skills: [] });
+  useEffect(() => {
+    api("/suggestions")
+      .then(setSuggestions)
+      .catch(() => {});
+  }, []);
   const [form, setForm] = useState<Record<string, string>>(() =>
       Object.fromEntries(
         [
@@ -1343,6 +1304,7 @@ function EditProfile({
   }
   return (
     <>
+      <LinkLogin />
       <div className="page-heading">
         <div className="eyebrow">BRING YOUR WHOLE SELF</div>
         <h1>
@@ -1407,7 +1369,15 @@ function EditProfile({
                           : 100
                   }
                   pattern={key === "zip" ? "[0-9]{5}" : undefined}
-                  list={key === "zip" ? "zip-list" : undefined}
+                  list={
+                    key === "zip"
+                      ? "zip-list"
+                      : key === "occupation"
+                        ? "occupation-list"
+                        : key === "expertise" || key === "needs"
+                          ? "skill-list"
+                          : undefined
+                  }
                   onChange={(e) => {
                     setForm({ ...form, [key]: e.target.value });
                     setSaved(false);
@@ -1426,6 +1396,16 @@ function EditProfile({
               </label>
             ))}
           </div>
+          <datalist id="occupation-list">
+            {suggestions.occupations.map((v) => (
+              <option key={v} value={v} />
+            ))}
+          </datalist>
+          <datalist id="skill-list">
+            {suggestions.skills.map((v) => (
+              <option key={v} value={v} />
+            ))}
+          </datalist>
           <datalist id="zip-list">
             {zips.map((z) => (
               <option key={z.zip} value={z.zip}>
@@ -1743,6 +1723,23 @@ function Admin() {
                 <strong>{m.name}</strong>
                 <small>{m.email}</small>
               </div>
+              {m.status === "approved" && !m.demo && (
+                <button
+                  className="text-button"
+                  onClick={async () => {
+                    try {
+                      await navigator.clipboard.writeText(
+                        `Hi ${m.name}, your Neighbor NYC profile is approved. Open ${data.appUrl} and sign in with ${m.email}. You do not need an administrator account.`,
+                      );
+                      setError("Invitation copied.");
+                    } catch {
+                      setError("Could not copy. App address: " + data.appUrl);
+                    }
+                  }}
+                >
+                  Copy invitation
+                </button>
+              )}
               <span className={`status ${m.status}`}>
                 {m.demo ? "Demo · " : ""}
                 {m.status}

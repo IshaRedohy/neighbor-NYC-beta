@@ -36,12 +36,16 @@ def review_submission(submission_id, approve):
         if existing:
             mid=existing['id']
             conn.execute('''UPDATE members SET name=%s,zip=%s,address=%s,occupation=%s,workplace=%s,bio=%s,languages=%s,
-                cultures=%s,countries=%s,expertise=%s,interests=%s,needs=%s,consent_at=now(),updated_at=now()
+                cultures=%s,countries=%s,expertise=%s,interests=%s,needs=%s,consent_at=now(),status='approved',updated_at=now()
                 WHERE email=%s''',values[1:]+(values[0],))
         else:
-            admins=[v.strip().lower() for v in os.getenv('ADMIN_EMAILS','').split(',')]
-            role='admin' if str(data.email) in admins else 'member'
+            role='member'  # Host privileges are granted only by the explicit bootstrap command.
             mid=conn.execute('''INSERT INTO members(email,name,zip,address,occupation,workplace,bio,languages,cultures,countries,expertise,interests,needs,status,role,consent_at)
                 VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'approved',%s,now()) RETURNING id''',values+(role,)).fetchone()['id']
+        if row.get('identity_id'):
+            identity=conn.execute('SELECT member_id FROM login_identities WHERE id=%s FOR UPDATE',(row['identity_id'],)).fetchone()
+            if existing and identity['member_id']!=mid:
+                raise HTTPException(409,'Existing member must link this verified login before approval.')
+            conn.execute('UPDATE login_identities SET member_id=%s WHERE id=%s',(mid,row['identity_id']))
         conn.execute("UPDATE submissions SET status='approved',member_id=%s,payload=NULL WHERE id=%s",(mid,submission_id))
         return {'ok':True,'memberId':str(mid)}

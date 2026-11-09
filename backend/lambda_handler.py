@@ -1,14 +1,11 @@
-"""Future Lambda entry point; no infrastructure is created by this module.
-
-Package with Python 3.12 Linux dependencies and configure networking/secrets first.
-Connection pools live for the warm execution environment, not one invocation.
-"""
-import os
+from .runtime import load_secrets
+load_secrets()
 from mangum import Mangum
-from .core import db_open, PRODUCTION
+from .core import db_open
 from .main import app
 
-if not PRODUCTION or os.getenv('DEMO_MODE') == 'true':
-    raise RuntimeError('Lambda requires ENVIRONMENT=production and DEMO_MODE=false.')
 db_open()
+# Mangum access logging is disabled: OAuth query strings and identities never enter logs.
+import logging
+logging.getLogger('mangum.http').setLevel(logging.WARNING)
 handler = Mangum(app, lifespan='off')

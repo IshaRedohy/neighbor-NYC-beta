@@ -17,6 +17,7 @@ from .models import ProfileInput, MessageInput, distance_miles
 from .intake import intake, review_submission, validate_zip
 from .auth import router as auth_router
 from .graph import graph_candidates
+from . import taxonomy
 
 @asynccontextmanager
 async def lifespan(app):
@@ -31,6 +32,12 @@ async def lifespan(app):
 app=FastAPI(title='NYC Neighbor Hub API',version='0.1.0',lifespan=lifespan,
             docs_url='/api/docs' if not PRODUCTION else None,openapi_url='/api/openapi.json' if not PRODUCTION else None)
 app.include_router(auth_router)
+from .messaging import router as messaging_router
+app.include_router(messaging_router)
+from .preferences import router as preferences_router
+app.include_router(preferences_router)
+from .signup import router as signup_router
+app.include_router(signup_router)
 from .community import router as community_router
 app.include_router(community_router)
 
@@ -43,11 +50,21 @@ async def security(request: Request, call_next):
             # Bound request bodies even when Content-Length is absent/chunked.
             request._body=await limited_body(request,1048576)
         response=await call_next(request)
+        if request.url.path.startswith('/api/auth/'):
+            request.scope['query_string']=b''  # Uvicorn must not log authorization codes.
+        if request.method in ('POST','PATCH','PUT','DELETE') and response.status_code<400 and (request.url.path.startswith('/api/me') or request.url.path.startswith('/api/admin/')):
+            from .sync_delivery import notify_sync
+            from starlette.concurrency import run_in_threadpool
+            await run_in_threadpool(notify_sync)
         response.headers['Cache-Control']='no-store'
         response.headers['X-Content-Type-Options']='nosniff'
         return response
     except HTTPException as e:
-        return JSONResponse({'error':e.detail},status_code=e.status_code)
+        return JSONResponse({'error':e.detail},status_code=e.status_code,headers={'Cache-Control':'no-store'})
+    except Exception as e:
+        logging.getLogger(__name__).error('RequestFailed exception=%s',type(e).__name__)
+        request.scope['query_string']=b''
+        return JSONResponse({'error':'The service is temporarily unavailable. Please try again shortly.'},status_code=500,headers={'Cache-Control':'no-store'})
 
 @app.exception_handler(HTTPException)
 async def http_error(request, exc):
@@ -64,11 +81,12 @@ async def invalid(request, exc):
 @app.exception_handler(OperationalError)
 @app.exception_handler(PoolTimeout)
 async def unavailable(request, exc):
-    return JSONResponse({'error':'Database unavailable. Start the local services and try again.'},status_code=503)
+    logging.getLogger(__name__).warning('DatabaseUnavailable exception=%s',type(exc).__name__)
+    return JSONResponse({'error':'The service is temporarily unavailable. Please try again shortly.'},status_code=503)
 
 @app.get('/api/config')
 def config():
-    return {'demo':demo_enabled(),'google':bool(os.getenv('GOOGLE_CLIENT_ID')),'formUrl':
+    return {'nativeSignup':os.getenv('NATIVE_SIGNUP')=='true','demo':demo_enabled(),'google':bool(os.getenv('GOOGLE_CLIENT_ID')),'formUrl':
             'https://docs.google.com/forms/d/'+os.environ['GOOGLE_FORM_ID']+'/viewform' if os.getenv('GOOGLE_FORM_ID') else None}
 
 @app.get('/api/health')
@@ -87,7 +105,10 @@ def zips():
 @app.get('/api/discover')
 def discover(request: Request, q: str=Query('',max_length=100), language: str=Query('',max_length=60),
              culture: str=Query('',max_length=60), country: str=Query('',max_length=60), interest: str=Query('',max_length=60),
-             radius: Literal['same','2','5','all']='5', page: int=Query(1,ge=1,le=10000)):
+             radius: Literal['same','2','5','all']='all', zip: str=Query('',max_length=5),
+             neighborhood: str=Query('',max_length=100), occupation: str=Query('',max_length=100),
+             specialty: str=Query('',max_length=60), help: Literal['','receive','give','both']='',
+             mode: Literal['recommended','nearby','help_me','i_can_help','shared']='recommended', page: int=Query(1,ge=1,le=10000)):
     me=member(request)
     rows=query(f'''SELECT {PUBLIC_FIELDS} FROM members m JOIN zip_codes z ON z.zip=m.zip
         WHERE m.status='approved' AND m.visible AND m.id<>%s AND (NOT m.demo OR %s)
@@ -96,35 +117,59 @@ def discover(request: Request, q: str=Query('',max_length=100), language: str=Qu
     available={'countries':sorted({t for p in rows for t in p['countries']}),'languages':sorted({t for p in rows for t in p['languages']}),
                'cultures':sorted({t for p in rows for t in p['cultures']}),
                'interests':sorted({t for p in rows for t in p['interests']})}
+    available.update({'occupations':sorted({taxonomy.occupation(p['occupation']) for p in rows}),
+        'specialties':sorted({t for p in rows for t in taxonomy.skills(p['expertise'])}),
+        'zips':sorted({p['zip'] for p in rows}),'neighborhoods':sorted({p['neighborhood'] for p in rows})})
+    preference=one('SELECT shared_culture FROM matching_preferences WHERE member_id=%s',(me['id'],))
+    shared_culture=bool(preference and preference['shared_culture'])
     candidates=[]
     for p in rows:
         p['distance']=round(distance_miles(me['lat'],me['lon'],p['lat'],p['lon']),1)
         if radius=='same' and me['zip']!=p['zip']: continue
         if radius not in ('same','all') and p['distance']>float(radius): continue
+        if zip and p['zip']!=zip: continue
+        if neighborhood and neighborhood.lower()!=p['neighborhood'].lower(): continue
+        if occupation and taxonomy.occupation(occupation)!=taxonomy.occupation(p['occupation']): continue
+        if specialty and specialty.lower() not in taxonomy.skills(p['expertise']): continue
+        can_receive=bool(taxonomy.skills(p['expertise']) & taxonomy.skills(me['needs']))
+        can_give=bool(taxonomy.skills(p['needs']) & taxonomy.skills(me['expertise']))
+        if (help in ('receive','both') or mode=='help_me') and not can_receive: continue
+        if (help in ('give','both') or mode=='i_can_help') and not can_give: continue
+        if mode=='nearby' and p['distance']>2: continue
+        if mode=='shared' and not (set(p['interests']) & set(me['interests']) or taxonomy.occupation(p['occupation'])==taxonomy.occupation(me['occupation'])): continue
         if language and language.lower() not in p['languages']: continue
         if country and country.lower() not in p['countries']: continue
         if culture and culture.lower() not in p['cultures']: continue
         if interest and interest.lower() not in p['interests']: continue
-        if q and q.lower() not in ' '.join([p['name'],p['occupation'],p['bio']]+p['expertise']+p['interests']+p['languages']+p['countries']+p['cultures']).lower(): continue
+        if q and q.lower() not in ' '.join([p['name'],p['occupation'],p['bio'],p['zip'],p['neighborhood'],p['borough']]+p['expertise']+p['needs']+p['interests']+p['languages']+p['countries']+p['cultures']).lower(): continue
         candidates.append(p)
     engine='neo4j'
     try:
+        if os.getenv('GRAPH_ENABLED','true')!='true': raise RuntimeError('Graph disabled')
+        if one('SELECT 1 FROM graph_outbox LIMIT 1'): raise RuntimeError('Graph catching up')
         scores=graph_candidates([str(p['id']) for p in candidates],me) if candidates else {}
-        if len(scores)!=len(candidates) or one('SELECT 1 FROM graph_outbox LIMIT 1'):
+        if len(scores)!=len(candidates):
             engine='postgresql'
     except Exception:
         scores={}
         engine='postgresql'
     for p in candidates:
-        shared_help=set(p['expertise']) & set(me['needs'])
+        shared_help=taxonomy.skills(p['expertise']) & taxonomy.skills(me['needs'])
         shared_lang=set(p['languages']) & set(me['languages'])
         shared_interest=set(p['interests']) & set(me['interests'])
+        mutual_help=taxonomy.skills(p['needs']) & taxonomy.skills(me['expertise'])
+        same_occupation=taxonomy.occupation(p['occupation'])==taxonomy.occupation(me['occupation'])
         score=scores.get(str(p['id'])) if engine=='neo4j' else None
-        p['_rank']=(-(score['help'] if score else len(shared_help)),p['distance'],
-                    -(score['interests'] if score else len(shared_interest)),-(score['languages'] if score else len(shared_lang)),p['name'])
+        p['_rank']=(-(score['help'] if score else len(shared_help)),
+                    -(score['mutual_help'] if score else len(mutual_help)),p['distance'],
+                    -(score['interests'] if score else len(shared_interest)),-(score['languages'] if score else len(shared_lang)),
+                    -(score['occupation'] if score else int(same_occupation)),-int(shared_culture and bool(set(p['cultures']) & set(me['cultures']))),p['name'],str(p['id']))
         p['reasons']=([f"Can help with {', '.join(sorted(shared_help))}"] if shared_help else [])
+        if mutual_help: p['reasons'].append(f"You can help with {', '.join(sorted(mutual_help))}")
+        if same_occupation: p['reasons'].append(f"Shared occupation: {p['occupation']}")
         if shared_interest: p['reasons'].append(f"Shared interests: {', '.join(sorted(shared_interest))}")
         p['reasons']+=([f"You both speak {', '.join(sorted(shared_lang))}"] if shared_lang else [])
+        if shared_culture and set(p['cultures']) & set(me['cultures']): p['reasons'].append('Shared culture (your preference)')
         if me['zip']==p['zip']: p['reasons'].append('In your ZIP code')
     candidates.sort(key=lambda p:p['_rank'])
     for p in candidates: del p['_rank']
@@ -171,6 +216,8 @@ def delete_profile(request: Request):
             visible=false,status='deleted',consent_at=NULL,updated_at=now() WHERE id=%s''',(me['id'],))
         conn.execute('DELETE FROM posts WHERE author_id=%s',(me['id'],))
         conn.execute('DELETE FROM sessions WHERE member_id=%s',(me['id'],))
+        conn.execute('DELETE FROM applicant_sessions WHERE identity_id IN (SELECT id FROM login_identities WHERE member_id=%s)',(me['id'],))
+        conn.execute("UPDATE login_identities SET email='deleted' WHERE member_id=%s",(me['id'],))
         conn.execute("UPDATE submissions SET payload=NULL,email='deleted',status=CASE WHEN status='pending' THEN 'rejected' ELSE status END WHERE email=%s OR member_id=%s",(me['email'],me['id']))
     return {'ok':True}
 
@@ -186,90 +233,6 @@ async def form_intake(request: Request):
     if not os.getenv('GOOGLE_FORM_ID') or value.get('formId')!=os.getenv('GOOGLE_FORM_ID'):
         raise HTTPException(403,'Unrecognized form. Configure GOOGLE_FORM_ID.')
     return intake(value)
-
-class StartConversation(MessageInput):
-    recipientId: UUID
-
-@app.post('/api/conversations')
-def start_conversation(data: StartConversation, request: Request):
-    me=member(request)
-    rate_limit('requests:'+str(me['id']),10)
-    if data.recipientId==me['id']: raise HTTPException(400,'Choose another member.')
-    with db() as conn:
-        conn.execute('SELECT pg_advisory_xact_lock(hashtext(%s))',(':'.join(sorted([str(me['id']),str(data.recipientId)])),))
-        target=conn.execute("SELECT id FROM members WHERE id=%s AND status='approved' AND visible AND (NOT demo OR %s)",
-                            (data.recipientId,demo_enabled())).fetchone()
-        if not target or is_blocked(conn,me['id'],data.recipientId): raise HTTPException(404,'Member unavailable.')
-        existing=conn.execute('SELECT id,status FROM conversations WHERE LEAST(sender_id,recipient_id)=LEAST(%s::uuid,%s::uuid) AND GREATEST(sender_id,recipient_id)=GREATEST(%s::uuid,%s::uuid)',
-                            (me['id'],data.recipientId,me['id'],data.recipientId)).fetchone()
-        if existing:
-            if existing['status']=='declined': raise HTTPException(403,'This message request was declined.')
-            return {'id':str(existing['id']),'existing':True}
-        cid=conn.execute('INSERT INTO conversations(sender_id,recipient_id) VALUES(%s,%s) RETURNING id',(me['id'],data.recipientId)).fetchone()['id']
-        conn.execute('INSERT INTO messages(conversation_id,sender_id,body) VALUES(%s,%s,%s)',(cid,me['id'],data.body))
-    return {'id':str(cid)}
-
-@app.get('/api/conversations')
-def conversations(request: Request):
-    me=member(request)
-    return query('''SELECT c.*,p.name AS other_name,p.id AS other_id,p.status AS other_status,
-        (SELECT body FROM messages WHERE conversation_id=c.id ORDER BY created_at DESC,id DESC LIMIT 1) AS last_message,
-        (SELECT count(*) FROM messages msg WHERE msg.conversation_id=c.id AND msg.sender_id<>%s
-            AND msg.created_at>COALESCE(r.read_at,'1970-01-01'::timestamptz))::int AS unread
-        FROM conversations c JOIN members p ON p.id=CASE WHEN c.sender_id=%s THEN c.recipient_id ELSE c.sender_id END
-        LEFT JOIN conversation_reads r ON r.conversation_id=c.id AND r.member_id=%s
-        WHERE (c.sender_id=%s OR c.recipient_id=%s)
-        AND NOT EXISTS(SELECT 1 FROM blocks b WHERE (b.blocker_id=%s AND b.blocked_id=p.id) OR (b.blocker_id=p.id AND b.blocked_id=%s))
-        ORDER BY c.updated_at DESC''',(me['id'],)*7)
-
-def conversation_access(conn,cid,me):
-    c=conn.execute('SELECT * FROM conversations WHERE id=%s AND (sender_id=%s OR recipient_id=%s) FOR UPDATE',
-                   (cid,me['id'],me['id'])).fetchone()
-    if not c: raise HTTPException(404,'Conversation not found.')
-    other=c['recipient_id'] if c['sender_id']==me['id'] else c['sender_id']
-    if is_blocked(conn,me['id'],other): raise HTTPException(403,'Conversation unavailable.')
-    return c,other
-
-@app.get('/api/conversations/{cid}/messages')
-def get_messages(cid: UUID, request: Request, before: Optional[str]=None):
-    me=member(request)
-    with db() as conn:
-        c,_=conversation_access(conn,cid,me)
-        rows=conn.execute('SELECT * FROM messages WHERE conversation_id=%s ORDER BY created_at,id',(cid,)).fetchall()
-    return {'conversation':c,'messages':rows}
-
-@app.post('/api/conversations/{cid}/read')
-def read_messages(cid: UUID,request: Request):
-    me=member(request)
-    with db() as conn:
-        conversation_access(conn,cid,me)
-        conn.execute('''INSERT INTO conversation_reads(conversation_id,member_id) VALUES(%s,%s)
-            ON CONFLICT(conversation_id,member_id) DO UPDATE SET read_at=now()''',(cid,me['id']))
-    return {'ok':True}
-
-@app.post('/api/conversations/{cid}/messages')
-def send_message(cid: UUID,data: MessageInput,request: Request):
-    me=member(request)
-    rate_limit('messages:'+str(me['id']),30)
-    with db() as conn:
-        c,other=conversation_access(conn,cid,me)
-        target=conn.execute('SELECT status FROM members WHERE id=%s',(other,)).fetchone()
-        if c['status']!='accepted' or target['status']!='approved': raise HTTPException(403,'This conversation is not open for messages.')
-        result=conn.execute('INSERT INTO messages(conversation_id,sender_id,body) VALUES(%s,%s,%s) RETURNING id',(cid,me['id'],data.body)).fetchone()
-        conn.execute('UPDATE conversations SET updated_at=now() WHERE id=%s',(cid,))
-    return result
-
-class Decision(BaseModel):
-    action: Literal['accept','decline']
-
-@app.post('/api/conversations/{cid}/decision')
-def decide(cid: UUID,data: Decision,request: Request):
-    me=member(request)
-    with db() as conn:
-        c,_=conversation_access(conn,cid,me)
-        if c['recipient_id']!=me['id'] or c['status']!='pending': raise HTTPException(403,'Only the recipient can respond to a pending request.')
-        conn.execute('UPDATE conversations SET status=%s,updated_at=now() WHERE id=%s',('accepted' if data.action=='accept' else 'declined',cid))
-    return {'ok':True}
 
 @app.post('/api/blocks/{mid}')
 def block(mid: UUID,request: Request):
@@ -314,7 +277,8 @@ def report(data: ReportInput,request: Request):
 @app.get('/api/admin')
 def admin(request: Request):
     member(request,True)
-    return {'submissions':query("SELECT s.*,EXISTS(SELECT 1 FROM members m WHERE m.email=s.email) AS existing_member FROM submissions s WHERE s.status='pending' ORDER BY created_at DESC"),
+    from .core import APP_URL
+    return {'appUrl':APP_URL,'submissions':query("SELECT s.*,EXISTS(SELECT 1 FROM members m WHERE m.email=s.email) AS existing_member FROM submissions s WHERE s.status='pending' ORDER BY created_at DESC"),
             'members':query("SELECT id,name,email,status,demo FROM members WHERE status<>'deleted' ORDER BY name"),
             'reports':query("SELECT r.*,m.name AS reported_name FROM reports r JOIN members m ON m.id=r.reported_id WHERE r.status='open' ORDER BY r.created_at"),
             'graph':one('SELECT count(*)::int AS pending,COALESCE(max(attempts),0) AS max_attempts FROM graph_outbox')}

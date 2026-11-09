@@ -1,4 +1,5 @@
 from typing import List, Literal
+from uuid import UUID
 from math import radians, sin, cos, atan2, sqrt
 from pydantic import BaseModel, Field, EmailStr, field_validator, ConfigDict
 
@@ -54,6 +55,7 @@ class Submission(BaseModel):
         return value.lower()
 
 class MessageInput(BaseModel):
+    clientMessageId: UUID | None = None
     body: str = Field(min_length=1,max_length=2000)
     @field_validator('body')
     @classmethod

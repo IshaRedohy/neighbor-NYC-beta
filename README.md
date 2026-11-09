@@ -81,9 +81,9 @@ Browser ── Next.js UI + same-origin API proxy ── Python/FastAPI
 ```
 
 - SQL owns profiles, approvals, sessions, conversations, messages, blocks, reports, community posts, event read receipts, and synchronization jobs. Input validation runs before storing submitted profile data.
-- Neo4j stores members' relationships to ZIPs, languages, expertise, interests, cultures, and countries. Emails and messages are not copied into it.
+- Neo4j stores display names and relationships to ZIPs, mapped neighborhoods, occupations, languages, expertise/needs, interests, cultures, and countries. Emails, addresses, and messages are not copied into it. See [viewing the graph](docs/GRAPH.md) for Neo4j Browser instructions and ready-to-run queries.
 - Discovery filters current SQL records, uses Neo4j relationship counts to rank candidates, and uses SQL ranking when the graph is unavailable or pending updates. Hidden/suspended/blocked members are filtered using current SQL state.
-- Skills matching the viewer's requested help rank first, then geographic proximity, shared interests, and languages. Cultural identity only filters results when selected explicitly.
+- Skills matching the viewer's requested help rank first, then help the viewer can offer back, geographic proximity, shared interests, languages, and occupation. Cultural identity only filters results when selected explicitly.
 - Google OAuth uses state, nonce, PKCE, verified ID tokens, approved-email matching, and an immutable Google subject binding. Sessions are opaque cookies backed by hashed database tokens. API mutations require a matching `Origin` (except the independently signed webhook).
 - First contact is a single pending message. Only the recipient can accept/decline; subsequent messages require acceptance. Polling refreshes the inbox every five seconds. No attachments, group chat, or email notifications in this beta.
 
@@ -130,6 +130,27 @@ PostgreSQL contains the authoritative data; rebuild Neo4j from SQL after a graph
 - Only approved members browse profiles. Login emails stay private except to the member and community host. Users decide what workplace/cultural information to include.
 - Profile deletion anonymizes the account and retains existing message text as disclosed. Google Form responses and downloaded exports must be removed separately by the host; deleting the local profile does not delete Google's copy.
 - Residential ZIP geography is approximate and excludes building-only ZIP codes. See [location sources](data/SOURCES.md).
-- This is a small beta (roughly 100–500 members), not a production launch. The app fetches the small candidate directory before ranking, messages currently load the full thread, and rate limits are basic. The [Lambda hosting guide](docs/AWS_DEPLOYMENT.md) covers scale, operations, security, and estimated total costs.
+- The first hosted beta targets 10–50 invited members. Discovery still fetches the small eligible directory before ranking; messaging uses bounded cursor pages and rate limits. The [Lambda hosting guide](docs/AWS_DEPLOYMENT.md) covers scale, operations, security, and estimated total costs.
 
 Real Google OAuth/form delivery requires your Google account configuration. No form has been created in your account automatically. Browser verification and actual checks performed are recorded in [TESTING.md](docs/TESTING.md).
+
+### Private hosted beta implementation
+
+Start with [the AWS setup guide](docs/AWS_DEPLOYMENT.md). It contains the Neon/Aura setup, CloudFront deployment, secrets, backup/restore, migration, rollback, and later Cognito signup instructions. Hosting has not been provisioned automatically.
+
+New local changes require an additive migration before restarting the backend:
+
+```sh
+.venv/bin/python -m backend.cli migrate
+.venv/bin/python -m uvicorn backend.main:app --host 127.0.0.1 --port 8001 --no-access-log
+```
+
+Set `BACKEND_URL=http://127.0.0.1:8001` in `.env` when using port 8001. Keep the frontend at `http://localhost:3000`. Continue the local worker as before. Google Forms intake remains the beta default; ordinary members never run `bootstrap-admin`.
+
+- Discovery includes recommendation sections, ZIP/neighborhood/occupation/skill/help filters, and a saved opt-in shared-culture preference.
+- Messaging uses cursor pages, visible-tab polling, incremental new messages, and duplicate-safe retries. The `/api/conversations` response is now `{conversations, nextCursor}`; messages return `{conversation, other, messages, nextCursor, latestCursor}`.
+- `npm run build:static` generates the S3 frontend in `out/` without the local API proxy or environment files. Normal `npm run dev` still uses the local proxy.
+- `NATIVE_SIGNUP=false` keeps Cognito signup disabled until the later release. Its code and separate CDK stack are included.
+- Run integration tests only with `docker compose -f compose.test.yaml up -d --wait`, then `scripts/test-integration.sh`. This uses separate temporary databases on ports 15432/17687, never real member data.
+
+Do not commit private form exports. A previously tracked export has been untracked locally; its old Git history still requires cleanup before any public repository publication.

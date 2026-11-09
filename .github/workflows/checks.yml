@@ -1,0 +1,31 @@
+name: Checks
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m venv .venv
+      - run: .venv/bin/pip install -r backend/requirements.lock.txt
+      - run: npm ci
+      - run: npm run build:static
+      - run: npm ci --prefix infra
+      - run: npm --prefix infra run typecheck && npm --prefix infra test
+      - run: docker compose -f compose.test.yaml up -d --wait
+      - run: scripts/test-integration.sh
+      - run: .venv/bin/python scripts/check-migration.py
+      - run: scripts/restore-check.sh
+      - run: docker build --platform linux/amd64 -f backend/Dockerfile.lambda -t neighbor-lambda:test .
+      - name: Smoke test the production Lambda adapter
+        run: docker run --rm -i --entrypoint python -e ENVIRONMENT=production -e DEMO_MODE=false -e APP_URL=https://example.test -e DATABASE_URL='postgresql://placeholder:unused@127.0.0.1/db?sslmode=require' -e SESSION_SECRET=0000000000000000000000000000000000000000 -e INTAKE_SECRET=1111111111111111111111111111111111111111 neighbor-lambda:test - < scripts/smoke-lambda.py
+      - if: always()
+        run: docker compose -f compose.test.yaml down -v

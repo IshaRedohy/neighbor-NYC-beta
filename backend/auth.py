@@ -45,6 +45,10 @@ def logout(request: Request):
         with db() as conn:
             conn.execute('DELETE FROM sessions WHERE token_hash=%s',(digest(token),))
     response=JSONResponse({'ok':True})
+    applicant_token=request.cookies.get('neighbor_applicant')
+    if applicant_token:
+        with db() as conn: conn.execute('DELETE FROM applicant_sessions WHERE token_hash=%s',(digest(applicant_token),))
+    response.delete_cookie('neighbor_applicant',path='/')
     response.delete_cookie('neighbor_session',path='/')
     return response
 
@@ -54,13 +58,13 @@ def google():
         return RedirectResponse(APP_URL+'/?'+urlencode({'error':'Google sign-in is not configured. See the setup guide or use a local demo account.'}))
     state,nonce,verifier=secrets.token_urlsafe(32),secrets.token_urlsafe(32),secrets.token_urlsafe(32)
     # Store state server-side in a short-lived, signed JWT; no client-controlled OAuth values.
-    secret=os.environ.get('INTAKE_SECRET','')
+    secret=os.environ.get('SESSION_SECRET') or os.environ.get('INTAKE_SECRET','')
     if len(secret)<32:
         raise HTTPException(503,'Configure INTAKE_SECRET before using Google sign-in.')
     import time
     pending=jwt.encode({'state':state,'nonce':nonce,'verifier':verifier,'exp':int(time.time())+600},secret,algorithm='HS256')
     params={'client_id':os.environ['GOOGLE_CLIENT_ID'],'redirect_uri':APP_URL+'/api/auth/callback',
-        'response_type':'code','scope':'openid email','state':state,'nonce':nonce,
+        'response_type':'code','scope':'openid email','prompt':'select_account','state':state,'nonce':nonce,
         'code_challenge':base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).decode().rstrip('='),'code_challenge_method':'S256'}
     response=RedirectResponse('https://accounts.google.com/o/oauth2/v2/auth?'+urlencode(params))
     response.set_cookie('neighbor_oauth',pending,httponly=True,samesite='lax',secure=PRODUCTION,max_age=600,path='/')
@@ -69,10 +73,11 @@ def google():
 @router.get('/callback')
 def callback(request: Request):
     stage='login_cookie'
+    error_code='expired'
     try:
         if not request.cookies.get('neighbor_oauth'):
             raise ValueError('Your sign-in cookie is missing. Open '+APP_URL+' and start Google sign-in again from that address.')
-        pending=jwt.decode(request.cookies.get('neighbor_oauth',''),os.getenv('INTAKE_SECRET',''),algorithms=['HS256'])
+        pending=jwt.decode(request.cookies.get('neighbor_oauth',''),(os.getenv('SESSION_SECRET') or os.getenv('INTAKE_SECRET','')),algorithms=['HS256'])
         if not secrets.compare_digest(request.query_params.get('state',''),pending['state']) or not request.query_params.get('code'):
             raise ValueError('Sign-in was cancelled or could not be verified.')
         stage='google_token'
@@ -89,16 +94,22 @@ def callback(request: Request):
             raise ValueError('Google account verification failed.')
         stage='member_lookup'
         with db() as conn:
-            m=conn.execute("SELECT id,google_sub FROM members WHERE email=%s AND status='approved' AND demo=false FOR UPDATE",(payload['email'].lower(),)).fetchone()
-            if not m:
+            m=conn.execute("SELECT id,google_sub,status FROM members WHERE email=%s AND demo=false FOR UPDATE",(payload['email'].lower(),)).fetchone()
+            if not m or m['status']=='pending':
+                pending_form=conn.execute("SELECT 1 FROM submissions WHERE email=%s AND status='pending'",(payload['email'].lower(),)).fetchone()
+                error_code='pending' if pending_form or m else 'wrong_account'
                 raise ValueError('Your profile needs approval. Use the Google email you submitted on the form.')
+            if m['status']!='approved':
+                error_code='suspended' if m['status']=='suspended' else 'wrong_account'
+                raise ValueError('This membership is suspended. Contact the community host.' if error_code=='suspended' else 'No active membership for this account.')
             if m['google_sub'] and m['google_sub']!=payload['sub']:
+                error_code='wrong_account'
                 raise ValueError('This profile is linked to a different Google account.')
             conn.execute('UPDATE members SET google_sub=%s WHERE id=%s',(payload['sub'],m['id']))
         stage='session_creation'
         response=session_response(m['id'],True)
     except ValueError as e:
-        response=RedirectResponse(APP_URL+'/?'+urlencode({'error':str(e)}),status_code=303)
+        response=RedirectResponse(APP_URL+'/?'+urlencode({'error':str(e),'status':error_code}),status_code=303)
     except Exception as e:
         # Never log exception text, cookies, callback URLs, or Google tokens.
         logger.warning('Google sign-in failed: stage=%s exception=%s',stage,type(e).__name__)
@@ -109,6 +120,6 @@ def callback(request: Request):
             'member_lookup':'Could not check your membership in the database. Check the backend terminal for the failure type.',
             'session_creation':'Could not save your login session. Check the backend terminal for the failure type.',
         }
-        response=RedirectResponse(APP_URL+'/?'+urlencode({'error':messages[stage]}),status_code=303)
+        response=RedirectResponse(APP_URL+'/?'+urlencode({'error':'Sign-in is temporarily unavailable. Please try again shortly.','status':'temporary'}),status_code=303)
     response.delete_cookie('neighbor_oauth',path='/')
     return response

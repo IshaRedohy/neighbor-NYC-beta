@@ -8,7 +8,8 @@
     "start": "next start --hostname 0.0.0.0",
     "typecheck": "tsc --noEmit",
     "test": ".venv/bin/python -m unittest discover -s backend/tests -p 'test_*.py'",
-    "format": "prettier --write app components lib next.config.ts"
+    "format": "prettier --write app components lib next.config.ts",
+    "build:static": "node scripts/build-static.mjs"
   },
   "dependencies": {
     "lucide-react": "^0.577.0",

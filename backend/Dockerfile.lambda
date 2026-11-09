@@ -1,0 +1,9 @@
+FROM public.ecr.aws/lambda/python:3.12@sha256:238f6bfd2c1c188aff3955c2f7ceb767fe9da1b3597d84264426a11690fcf2d7
+# PostgreSQL client matches local PostgreSQL 17 and can dump supported older servers.
+RUN dnf install -y postgresql17-17.11-1.amzn2023.0.1 && dnf clean all
+COPY backend/requirements.lock.txt /tmp/requirements.txt
+RUN pip install --no-cache-dir -r /tmp/requirements.txt --target ${LAMBDA_TASK_ROOT}
+COPY backend ${LAMBDA_TASK_ROOT}/backend
+COPY db ${LAMBDA_TASK_ROOT}/db
+COPY data/nyc-zips.json ${LAMBDA_TASK_ROOT}/data/nyc-zips.json
+CMD ["backend.lambda_handler.handler"]
