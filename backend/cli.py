@@ -3,7 +3,8 @@ import json
 import sys
 from .core import ROOT, db_open, pool, db, demo_enabled
 
-NEIGHBORHOODS={'11372':'Jackson Heights','11103':'Astoria','11211':'Williamsburg','11216':'Bedford-Stuyvesant',
+# NYC Neighborhood Explorer: ZIP labels are approximate, not neighborhood boundaries.
+NEIGHBORHOODS={'11368':'Corona / Willets Point','11372':'Jackson Heights','11103':'Astoria','11211':'Williamsburg','11216':'Bedford-Stuyvesant',
  '10002':'Lower East Side','10027':'Harlem','10451':'Mott Haven','10301':'St. George','11373':'Elmhurst',
  '11218':'Kensington','11432':'Jamaica','10003':'East Village','11201':'Brooklyn Heights','11101':'Long Island City'}
 

@@ -1,78 +1,124 @@
-# Future AWS hosting: Lambda, not Lightsail
+# Private beta deployment
 
-**Current decision: stay local until friends' testing data has been collected.** Nothing in this repository provisions AWS services. Google Forms is the only remote collection service required now; its responses can be imported into local PostgreSQL. This guide is a future deployment plan, not a claim that the current app has been cloud-tested.
+The repository now contains the Lambda/static-site deployment, gated native signup, and release workflows. **No hosted stack has been deployed.** Create the managed databases below before deployment. Start with a CloudFront address; a custom domain is optional later.
 
-Pricing checked September 27, 2026. Estimates use US East planning rates, USD, 730 hours/month, a small 100–500-member beta, and no promotional credits. Verify the chosen region and providers in their calculators before deployment.
+## Architecture
 
-## Is Lambda cheaper?
+CloudFront serves a private S3 static Next.js export and forwards `/api/*` to an HTTP API → FastAPI Lambda. APIs are never cached; cookies, query strings, Origin, redirects and Set-Cookie pass through. The browser uses one HTTPS origin. There is no VPC or NAT gateway.
 
-For intermittent API traffic, Lambda itself is inexpensive. At **100,000 requests/month, 512 MB, and 300 ms average execution time**, compute is 15,000 GB-seconds, about **$0.25**, plus **$0.02** in requests before free-tier allowances. HTTP API Gateway adds about **$0.10**. These are usage examples, not a measured performance forecast. [Lambda pricing](https://aws.amazon.com/lambda/pricing/), [HTTP API pricing](https://aws.amazon.com/api-gateway/pricing/)
+PostgreSQL is authoritative. Use Neon Launch in AWS us-east-1, PostgreSQL **17**, with its paid restore history configured. Use the pooled URL for Lambda, the direct URL for migrations and backups. [Neon connection pooling](https://neon.com/docs/connect/connection-pooling).
 
-PostgreSQL and Neo4j cannot run as persistent databases inside Lambda. Their hosting, backups, and networking can cost substantially more than the API. Replacing a small server with Lambda therefore does **not** guarantee a smaller total bill.
+Neo4j Aura Free is a rebuildable projection. A disabled/paused/unavailable graph falls back to PostgreSQL. SQL eligibility and the same canonical matching vocabulary apply to both engines. A SQL outbox, SQS notification, bounded sync Lambda, hourly recovery and dead-letter queues handle missed or failed sync. Staging sets `GRAPH_ENABLED=false`; CI uses a separate Neo4j container. [Aura plans](https://neo4j.com/pricing/).
 
-## Target architecture
+## 1. Create the databases
 
-```text
-Browser → CloudFront → private S3 origin: exported Next.js frontend
-                    → /api/*: API Gateway HTTP API → Python FastAPI on Lambda
-                                                       ├─ PostgreSQL (Aurora)
-                                                       └─ Neo4j AuraDB
+1. In Neon, create a **Launch** project for beta, us-east-1, PostgreSQL 17. Set a seven-day restore window, autosuspend, and the smallest compute range suitable for the beta. Confirm those settings in the provider console; the AWS stack cannot enforce them.
+2. Create a **separate staging project** with synthetic data. Do not branch staging from the live member database. A free staging project is sufficient for fallback tests; production must have recovery enabled.
+3. Copy each project's pooled and direct connection strings (both require `sslmode=require`, or `verify-full`). Do not add these values to Git.
+4. Create an AuraDB Free instance near us-east-1 where offered. Save its `neo4j+s://` URI, username and generated password locally. This is for beta; staging needs no graph instance. Free instances may pause; do not add keepalive traffic.
+5. Copy `.env.hosted.example` to `.env.hosted.staging` and `.env.hosted.beta`. Fill the corresponding connections. Keep the local `.env` unchanged.
+6. Generate **two different** random secrets for each environment:
+   ```sh
+   .venv/bin/python -c 'import secrets; print(secrets.token_hex(32))'
+   ```
+   Put one in `SESSION_SECRET`, another in `INTAKE_SECRET`. The intake secret must also match Apps Script if enabling webhook delivery. Manual JSON import does not require delivery.
+7. Supply the existing Google OAuth client credentials and form ID. Use a separate Google OAuth client for staging if practical. `APP_URL=https://replace-after-deploy.cloudfront.net` is only a first-deploy placeholder.
 
-Google Forms → signed HTTPS intake → same Python API → SQL outbox
-SQL outbox → bounded, retryable graph-sync Lambda → Neo4j
+The files are ignored. Use the helper to upload configuration without placing passwords on command lines:
+
+```sh
+.venv/bin/python scripts/hosted.py secret --env-file .env.hosted.staging --secret-name neighbor/staging
+.venv/bin/python scripts/hosted.py migrate --env-file .env.hosted.staging
 ```
 
-- **Frontend:** This beta's UI is client-rendered, so the economical future deployment is Next.js static export to private S3 + CloudFront. Before exporting, replace the optional catch-all page with explicit `/`, `/discover`, `/messages`, `/profile`, and `/admin` pages; remove the Next.js API proxy and route `/api/*` directly to API Gateway through CloudFront. Add `output: 'export'` and verify deep-link handling. These are future edits: today's app intentionally uses the local proxy and is not currently an S3 upload artifact.
-- **API:** Package `backend/` and Linux-compatible Python 3.12 dependencies for Lambda. `backend/lambda_handler.py` provides the Mangum handler. Start with 512 MB, a 20-second timeout, no provisioned concurrency, and a small reserved concurrency limit (for example, five) to protect SQL connection capacity. Benchmark and tune before increasing it. Do not package your Mac `.venv`.
-- **PostgreSQL:** Use Aurora PostgreSQL Serverless v2 with an engine version that supports automatic pause at zero ACUs if infrequent-use savings are desired. Keep it private. Start with a small maximum capacity and alerts; startup latency after a pause may exceed this beta's five-second SQL pool timeout, so add bounded resume-aware retry and suitable timeouts before deploying. [Aurora pause/resume guidance](https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/aurora-serverless-v2-auto-pause.html)
-- **Graph:** Neo4j AuraDB Free can serve a constrained experiment after checking current quotas, availability, inactivity rules, and region. Use Professional for the first paid tier when appropriate. AuraDB is a Neo4j-managed service, optionally hosted in AWS; it is not an AWS-native Lambda database. [Neo4j plans](https://neo4j.com/pricing/)
-- **Networking:** A VPC-connected API accessing private Aurora still needs a working outbound path to Google OAuth and a public Aura endpoint. Budget a NAT gateway in the straightforward deployment. Merely placing Lambda in a public subnet does not provide internet access. [AWS networking guidance](https://docs.aws.amazon.com/lambda/latest/dg/configuration-vpc-internet.html)
-- **Background work:** Replace the local infinite worker loop with a bounded Lambda invocation. Trigger processing after committed profile mutations through a durable dispatch mechanism; retain the SQL outbox for recovery. Use SQS retries/dead-letter handling and a low-frequency reconciliation job. Never rely on an unawaited background task after an HTTP response.
+Save the returned secret ARN. Use an IAM deployment role/SSO profile, not root credentials. The stack grants runtime Lambdas only secret read, queue access, and backup bucket writes as appropriate.
 
-The current five-second polling worker and open SQL connections would undermine Aurora auto-pause. Do not deploy that loop as-is. Reduce the pool size for Lambda, close idle SQL connections promptly, pause browser polling when tabs are hidden, and avoid health checks/reconciliation schedules that repeatedly wake the database. Document the expected tradeoff between stale graph projection and waking the database.
+## 2. Check and deploy staging
 
-## Approximate monthly costs
+Required tools: Docker, Node 22+, Python 3.12, AWS CLI and a configured deployment role. CDK and dependencies are pinned in `infra/package-lock.json`.
 
-Two Aurora compute scenarios: 0.5 ACU active for 150 hours/month (about $9), or 0.5 ACU active all 730 hours (about $43.80), using $0.12/ACU-hour. These assume the database actually stays at that capacity while active; automatic scaling can cost more. [Aurora pricing examples](https://aws.amazon.com/rds/aurora/pricing/)
+```sh
+npm ci
+npm ci --prefix infra
+npm run build:static
+npm --prefix infra test
+mkdir -p .artifacts
+cd infra
+npx cdk bootstrap
+npx cdk deploy Neighbor-staging -c stage=staging --parameters AppSecretArn=YOUR_SECRET_ARN --parameters AlertEmail=YOUR_EMAIL --outputs-file ../.artifacts/outputs.json
+cd ..
+```
 
-| Item | Intermittent-use experiment | Continuously active small beta |
-|---|---:|---:|
-| Python Lambda, example usage above | $0.27 | $0.27 |
-| HTTP API Gateway, 100k calls | $0.10 | $0.10 |
-| Static frontend, CDN, build allowance | $1–5 | $1–5 |
-| Aurora compute assumption | $9 | $43.80 |
-| SQL storage, I/O, backup allowance | $2–5 | $2–5 |
-| Neo4j graph | $0 Free, if suitable | $65.70 Professional 1 GB |
-| One NAT gateway, hourly charge | $32.85 | $32.85 |
-| One NAT public IPv4 address | $3.65 | $3.65 |
-| Logs, secrets, queues, DNS, domain allowance | $3–8 | $3–8 |
-| **Approximate total** | **$52–65/month** | **$152–164/month** |
+The stack creates a CloudFront address; it does not publish private local files. Build uses an allowlisted staging directory, excluding `.env`, API proxy routes and response exports. The Lambda image contains backend code, migrations and the public ZIP reference only. Image dependencies are Linux x86-64, not the local macOS virtual environment.
 
-NAT is estimated at $0.045/hour; public IPv4 at $0.005/hour. NAT data processing, internet transfer, extra AZs, endpoints, replicas, WAF, RDS Proxy, and unusual traffic are additional. The table's frontend/storage/operations ranges are planning allowances, not individual vendor quotes. Domain cost is amortized, though normally paid annually. [VPC pricing](https://aws.amazon.com/vpc/pricing/)
+Before calling the API:
 
-Neo4j Professional's listed entry price is $0.09/hour, or $65.70 over 730 hours. It has its own terms and availability characteristics; confirm the chosen AWS region. [Neo4j pricing](https://neo4j.com/pricing/)
+1. Read `AppUrl` from `.artifacts/outputs.json`. Set it as `APP_URL` in the staging secret file and upload the secret again.
+2. In Google's OAuth Web client, add **that exact origin** and redirect URI `https://YOUR-DISTRIBUTION.cloudfront.net/api/auth/callback`. Keep the localhost URI for local work.
+3. Keep Google's test-user audience limited to invited testers while in testing mode. Add their accounts as needed.
+4. Publish the frontend and smoke-test it:
+   ```sh
+   STAGE=staging .venv/bin/python scripts/release.py publish
+   ```
+5. Confirm the SNS subscription email and budget notifications. There is intentionally no frequent health-check schedule.
 
-Keeping the graph on the free tier in the second scenario brings that estimate to approximately **$87–99/month**. With private Aurora, the straightforward NAT arrangement alone is much larger than the Lambda bill. A managed Postgres provider reachable over TLS from a non-VPC Lambda can avoid that NAT setup, but changes the AWS-only database choice; compare provider limits and total costs before choosing. An AWS-only Data API architecture could also change networking costs, but requires replacing the current psycopg access layer and carefully validating transaction/latency behavior. Neither alternative is implemented here.
+Secrets are read on cold start. After subsequent secret changes, recycle all affected Lambda execution environments with a configuration update/redeployment; changing Secrets Manager alone does not refresh warm clients. `scripts/refresh-runtime.py` does this using the saved stack outputs.
 
-Free tiers may lower some actual charges, but the estimates deliberately do not depend on credits. Local development has **$0 AWS hosting cost**.
+For the empty staging database, create the host explicitly:
 
-## Deployment sequence when you are ready
+```sh
+.venv/bin/python scripts/hosted.py bootstrap --env-file .env.hosted.staging --email YOUR_GOOGLE_EMAIL
+```
 
-1. **Finish the local pilot.** Validate a real Google submission, approval, matching, Google sign-in, message request/acceptance/reply, blocking, and deletion. Get feedback on ZIP proximity and expertise labels. Decide the retention policy for Google responses, JSON exports, messages, and backups.
-2. **Prepare a staging environment.** Create infrastructure as code only when hosting is requested. Use a dedicated AWS environment, least-privilege roles, Secrets Manager, HTTPS, budget alerts, and separate staging Google OAuth configuration. Restrict admin bootstrap access. Enforce `ENVIRONMENT=production` and `DEMO_MODE=false`; startup refuses production demo mode.
-3. **Adapt for Lambda.** Make the frontend/static changes above. Forward all required HTTP methods, cookies, query strings, `Origin`, and intake signature headers through CloudFront. Disable caching on `/api/*`; preserve `Set-Cookie` and redirects. Block inappropriate methods/body sizes at the edge. Ensure error responses also stay uncached. Use one public hostname and set `APP_URL` to it.
-4. **Prepare database access.** Configure TLS certificate validation, private security groups, low connection limits and concurrency, engine-compatible SQL migration testing, pause/resume retry, backup retention, and restore tests. Plan at least one staging migration through the same code path used in production.
-5. **Migrate data.** Take an encrypted PostgreSQL backup; restore only intended pilot data into the staging/production database. Keep demo profiles excluded or remove them with a reviewed targeted migration. Rebuild Neo4j from SQL and verify relationship counts; do not migrate messages or emails into the graph. Preserve the original local dump for rollback.
-6. **Wire the real integrations.** Add the production Google redirect URI `/api/auth/callback`, complete Google consent-screen requirements, update Apps Script's intake URL and secret, and check a signed test submission. Scheduled replay must remain idempotent. Rotate all example/development secrets.
-7. **Test and observe.** Measure cold starts, paused-database recovery, request latency, graph downtime fallback, worker retries, dead-letter recovery, duplicate delivery, rate limits, and message authorization. Add monitoring for 5xx responses, failed OAuth callbacks (without token logging), SQL saturation, outbox age, queue dead letters, and spend. Alert on $10/$25/$50/$100 thresholds appropriate to the selected architecture.
-8. **Release to a small invited group.** Check a rollback to the previous API/frontend versions and restore a backup into an isolated database before expanding. Maintain an accessible community-host contact route and deletion-request process.
+Beta migration already preserves your existing host; do not bootstrap ordinary members.
 
-## Improvements before larger scale
+Staging demo login remains **off**. Use approved synthetic Google test profiles to exercise the hosted journey; never copy real member data into staging.
 
-- Move candidate filtering and ranking into bounded SQL/graph queries with appropriate indexes; avoid reading the whole directory.
-- Add cursor pagination for messages and conversations, and stop browser polling on hidden/inactive tabs. Consider an event-driven chat transport only when measured demand justifies it.
-- Add audited moderation actions and stronger abuse controls; hash session tokens as now, expire sessions on security changes, and implement an incident-response process.
-- Replace broad development CSP script allowances with a production nonce-based policy compatible with the chosen frontend hosting mode.
-- Keep dependencies locked and scanned, test migrations on a restore, add CI, and run actual browser/accessibility checks. A local passing build is not a cloud-readiness certificate.
+## 3. Prepare beta data
 
-**Recommendation for today:** collect with Google Forms, import into the running local beta, and measure real usage before paying for any hosted databases.
+Run the same deployment with `stage=beta`, a different Neon project, different secret ARN, and Aura credentials. First apply migrations to the target with `scripts/hosted.py migrate`. Pause local writes for the migration snapshot.
+
+```sh
+.venv/bin/python scripts/migrate-data.py --source-env .env --target-env .env.hosted.beta
+```
+
+This refuses a target that already has members, copies real members and their related conversations/posts in one transaction, retains UUIDs, approval statuses and roles, and excludes demo members. Sessions and OAuth state are not transferred. Pending form submissions must be re-imported from the original private export; native signup should remain disabled until after this migration. The graph is regenerated from the SQL outbox. Reconcile member counts and host roles before inviting anyone. Keep the original database backup until the hosted restore drill passes.
+
+Manual Forms intake still works: download the private Apps Script JSON → host imports under Manage community → approve → copy invitation. Members use their submitted Google account. `bootstrap-admin` is only for the owner, never ordinary members.
+
+## 4. Backups, monitoring, and rollback
+
+- Daily Lambda `pg_dump` uses the **direct** Neon endpoint and uploads an encrypted dump to a private S3 bucket. Retention is 30 days. PostgreSQL client is pinned to 17; choose Neon 17 or update/test the image before using a newer server.
+- Neon paid restore history supplements the logical backup. Set it in Neon; it is not provisioned by CDK.
+- CloudWatch alarms cover API/sync/backup invocation errors, missing daily backup, old queue messages, and both DLQs. App service failures also emit safe stage/type logs. Logs expire after 14 days; access logs contain request ID, status and latency, never query strings, cookies or request bodies.
+- AWS budget notifications are set at $20/$35/$50 for total AWS account cost. **They exclude Neon billing, are not spending caps, and may include other AWS projects.** Enable Neon usage alerts separately. The $15–50 target is not a guarantee; polling can keep SQL compute active.
+- Test a restore **before inviting five people**: invoke the Backup function once, download that dump to a private local folder, restore into a separate Neon recovery branch/project using `PGDATABASE` in the environment and `pg_restore --no-owner --no-acl --exit-on-error`, then compare member UUIDs/roles/status and message counts. Never restore over the running database during a drill.
+- `scripts/restore-check.sh` demonstrates the same dump/restore process against isolated synthetic PostgreSQL. It does not prove the hosted Neon backup path until the hosted drill runs.
+- Roll back an application release by rerunning the deployment workflow on a previously tested commit. S3 is versioned, and prior hashed assets are retained. Database migrations are additive; do not automatically drop columns on rollback. If data needs recovery, restore to a new branch and switch the secret only after validation.
+- After an Aura outage, inspect the host pending count and DLQ. Hourly recovery processes the authoritative outbox even after SQS retries exhaust. If pending work persists, correct credentials/service availability and redrive the queue; never delete SQL outbox entries as a recovery shortcut.
+
+## 5. GitHub deployment
+
+`.github/workflows/checks.yml` builds the static frontend, validates CDK, runs isolated SQL/Neo4j tests, demonstrates restore, and builds the Linux image. `.github/workflows/deploy.yml` is a manually triggered deployment pipeline for `staging` or `beta`.
+
+Create GitHub environments `staging` and `beta` with variables `AWS_ROLE_ARN`, `APP_SECRET_ARN`, `ALERT_EMAIL`. Configure the AWS role's OIDC trust for **this repository and the selected GitHub environment**, audience `sts.amazonaws.com`; permit only CDK bootstrap deployment roles, the corresponding app secret read, release bucket sync, CloudFront invalidation, and stack operations. Use GitHub environment protection for beta. Do not store AWS access keys in GitHub.
+
+Run Checks successfully on the selected commit before Deploy. On the first deployment, complete the manual CloudFront/Google configuration above; subsequent runs migrate using the direct DB URL, deploy the image/stack, sync static assets, invalidate CloudFront, and smoke-test direct routes and unauthenticated access.
+
+**Repository history:** a private response export was present in the initial commit. It is now removed from the index and ignored, but older history still contains it. Do not publish that history publicly; use a clean sanitized repository or perform a separately reviewed history cleanup before public publication. No history was rewritten automatically.
+
+## 6. Native signup (disabled by default)
+
+After the first hosted feedback, enable the prepared Cognito stack. It uses Essentials managed login, Google federation, email OTP, PKCE, nonce validation and one-use state. The app never creates, receives, or stores email OTP codes. [Cognito authentication methods](https://docs.aws.amazon.com/cognito/latest/developerguide/amazon-cognito-user-pools-authentication-flow-methods.html).
+
+1. Verify an SES sender/domain, request production email sending access, and configure DKIM and delivery/bounce monitoring. Do not turn on public email login while SES is still limited to verified recipients. [Cognito email configuration](https://docs.aws.amazon.com/cognito/latest/developerguide/user-pool-email.html).
+2. Deploy `Neighbor-beta-Signup` with `-c stage=beta -c signup=true` and parameters `AppUrl`, `SesIdentityArn`, `EmailFrom`, `AppSecretArn`. No other stack needs to be redeployed for Cognito outputs.
+3. Add `https://YOUR-COGNITO-DOMAIN/oauth2/idpresponse` to the Google OAuth client's redirect URIs. Keep the app's original Google callback for migration/account linking.
+4. Copy the Cognito issuer/domain/client ID outputs into `.env.hosted.beta`, set `NATIVE_SIGNUP=true`, upload the secret, and refresh runtime configuration.
+5. Existing members first use the original Google login, then **My profile → Link Google or email-code login**. Linking requires their active member session plus a fresh verified provider login. Matching an email alone never links two provider identities. New applicants verify identity, complete the app form, and wait for host approval; they cannot access member or admin endpoints.
+6. Exercise expired/cancelled/reused login flows, email delivery failures, provider linking conflicts and migrated member roles on staging before enabling beta. Codes expiring/reuse are enforced by Cognito and still require live hosted acceptance tests.
+7. Keep JSON imports during transition; retire the public form only after this flow works with real invited users.
+
+## Launch acceptance
+
+Start with five people on the hosted domain: ordinary login/admin denial; wrong account/pending/suspended/expired states; approved import visibility; filtering and culture opt-in; two-person request/accept/reply/retry/older pages/unread/block/report; cold DB wake; unavailable graph; queue failure/recovery; backup restore; rollback. Then expand to 10–50. These hosted and provider-specific checks remain pending until the services are created.

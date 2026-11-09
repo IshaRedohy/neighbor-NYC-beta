@@ -1,0 +1,1 @@
+{"name":"neighbor-hub-infrastructure","private":true,"scripts":{"synth":"cdk synth","test":"tsx test.ts","typecheck":"tsc --noEmit"},"dependencies":{"aws-cdk-lib":"2.249.0","constructs":"10.5.0"},"devDependencies":{"aws-cdk":"2.1112.0","tsx":"4.21.0","typescript":"5.9.3","@types/node":"22.19.0"}}

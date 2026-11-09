@@ -15,9 +15,9 @@ ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(ROOT / '.env')
 PRODUCTION = os.getenv('ENVIRONMENT') == 'production'
 APP_URL = os.getenv('APP_URL', 'http://localhost:3000').rstrip('/')
-pool = ConnectionPool(os.environ.get('DATABASE_URL', ''), min_size=0, max_size=8,
-                      timeout=5, open=False, check=ConnectionPool.check_connection,
-                      kwargs={'row_factory': dict_row})
+pool = ConnectionPool(os.environ.get('DATABASE_URL', ''), min_size=0, max_size=int(os.getenv('DB_POOL_MAX','2' if PRODUCTION else '8')),
+                      max_idle=30, max_lifetime=300, timeout=15 if PRODUCTION else 5, open=False, check=ConnectionPool.check_connection,
+                      kwargs={'row_factory': dict_row, 'connect_timeout':10, 'prepare_threshold':None})
 
 def db_open():
     pool.open()

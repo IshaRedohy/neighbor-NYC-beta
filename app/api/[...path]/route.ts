@@ -7,9 +7,12 @@ async function proxy(
 ) {
   const { path } = await context.params;
   // Set the login cookie on the same host Google will redirect back to.
-  if (req.method === "GET" && path.join("/") === "auth/google") {
+  if (
+    req.method === "GET" &&
+    ["auth/google", "auth/cognito"].includes(path.join("/"))
+  ) {
     const loginUrl = new URL(
-      "/api/auth/google",
+      "/api/" + path.join("/"),
       process.env.APP_URL || "http://localhost:3000",
     );
     if (req.headers.get("host") !== loginUrl.host) {
@@ -79,10 +82,17 @@ async function proxy(
   } catch {
     return NextResponse.json(
       {
-        error: "Could not reach the Python backend. Check its terminal for startup errors and confirm its port matches BACKEND_URL in .env.",
+        error:
+          "Could not reach the Python backend. Check its terminal for startup errors and confirm its port matches BACKEND_URL in .env.",
       },
       { status: 503 },
     );
   }
 }
-export { proxy as GET, proxy as POST, proxy as PATCH, proxy as DELETE };
+export {
+  proxy as GET,
+  proxy as POST,
+  proxy as PATCH,
+  proxy as DELETE,
+  proxy as PUT,
+};

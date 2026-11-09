@@ -1,0 +1,55 @@
+name: Deploy hosted beta
+on:
+  workflow_dispatch:
+    inputs:
+      stage:
+        type: choice
+        options: [staging, beta]
+        required: true
+permissions:
+  contents: read
+  id-token: write
+concurrency:
+  group: deploy-${{ inputs.stage }}
+  cancel-in-progress: false
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.stage }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m venv .venv && .venv/bin/pip install -r backend/requirements.lock.txt
+      - run: npm ci && npm ci --prefix infra
+      - run: npm run build:static && npm --prefix infra test
+      - run: docker compose -f compose.test.yaml up -d --wait
+      - run: scripts/test-integration.sh
+      - run: .venv/bin/python scripts/check-migration.py
+      - run: scripts/restore-check.sh
+      - if: always()
+        run: docker compose -f compose.test.yaml down -v
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+      - name: Migrate with a direct connection (no secret output)
+        env:
+          APP_SECRET_ARN: ${{ vars.APP_SECRET_ARN }}
+        run: .venv/bin/python scripts/release.py migrate
+      - name: Deploy infrastructure
+        working-directory: infra
+        env:
+          STAGE: ${{ inputs.stage }}
+          SECRET_ARN: ${{ vars.APP_SECRET_ARN }}
+          ALERT_EMAIL: ${{ vars.ALERT_EMAIL }}
+        run: npx cdk deploy "Neighbor-$STAGE" -c "stage=$STAGE" --require-approval never --parameters "AppSecretArn=$SECRET_ARN" --parameters "AlertEmail=$ALERT_EMAIL" --outputs-file ../.artifacts/outputs.json
+      - name: Publish frontend and smoke test
+        env:
+          STAGE: ${{ inputs.stage }}
+        run: .venv/bin/python scripts/release.py publish

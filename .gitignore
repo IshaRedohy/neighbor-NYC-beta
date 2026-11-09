@@ -11,3 +11,14 @@ test-results/
 __pycache__/
 *.pyc
 .pytest_cache/
+
+# Private form exports and release artifacts
+neighbor-responses*.json
+.build-static/
+out/
+.artifacts/
+infra/cdk.out/
+infra/node_modules/
+*.dump
+
+!.env.hosted.example
