@@ -1,4 +1,6 @@
-# View and use your local relationship graph
+# View and use your relationship graph
+
+## Local Docker graph
 
 Open **http://localhost:7474** (Neo4j Browser). Connect to `bolt://localhost:7687`,
 database `neo4j`, username `neo4j`, and the `NEO4J_PASSWORD` value in your local `.env`.
@@ -8,6 +10,14 @@ Run the first query below and select the **Graph** result view. Click a person t
 inspect their display name; expand a node to see more connections. In the graph
 style controls, set the Person caption to `name`, Zip to `code`, and other node
 captions to `name` if Neo4j does not choose them automatically.
+
+## Hosted Aura graph and MCP
+
+For Aura, select the intended instance in the Aura console and verify its status before viewing its data. Use that instance's query interface and driver connection details. The local Browser URL above opens Docker Neo4j; it does not establish whether an Aura instance exists or contains the same data.
+
+Neo4j MCP uses `https://<instance-id>.mcp-instances.neo4j.io`; the Python app uses the separate `neo4j+s://` driver URI with `NEO4J_USER` and `NEO4J_PASSWORD`. Follow the [official MCP setup](https://neo4j.com/docs/mcp/current/quickstart/) for tool authentication. A configured MCP endpoint alone does not prove that its tools are callable or that the database is running.
+
+Inspect schema or run `RETURN 1 AS connected` through the available read-only query tool to verify database access before inspecting member data. Confirm the target instance/database first. Hosted setup and SQL-to-graph synchronization are covered in the [deployment guide](AWS_DEPLOYMENT.md); connecting MCP does not copy local data to Aura.
 
 ## Show approved, visible real members and their attributes
 

@@ -1,6 +1,23 @@
 # Private beta deployment
 
-The repository now contains the Lambda/static-site deployment, gated native signup, and release workflows. **No hosted stack has been deployed.** Create the managed databases below before deployment. Start with a CloudFront address; a custom domain is optional later.
+This is the first-time hosted setup guide. As of 2026-11-09, the Neon, Neo4j, GitHub, and AWS accounts have been connected to MCP through OAuth. **The hosted databases and AWS application infrastructure have not been created.** The GitHub repository and local Docker databases already exist.
+
+The repository contains the Lambda/static-site deployment, gated native signup, and release workflows. Start by creating the managed databases in section 1, then deploy staging and prepare beta. Start with a CloudFront address; a custom domain is optional later.
+
+## 0. Confirm account access
+
+Use the connected MCP servers for supported setup operations. OAuth connects the agent to your accounts; database creation, application credentials, and AWS deployment are separate steps in this guide.
+
+| Service | Confirm before initial setup |
+| --- | --- |
+| Neon | Access to the intended organization, where the beta and staging projects will be created. |
+| Neo4j | Access to the intended Aura account/project, where the beta graph instance will be created. |
+| AWS | The intended AWS account, deployment role, and region for creating the application stacks. |
+| GitHub | The intended repository, current branches, and relevant PRs and checks. Follow `AGENTS.md` to avoid branch conflicts and mixing unrelated changes into commits. |
+
+If a server's tools are unavailable in the current session, resolve access or use an authenticated CLI/console for that step. Tool availability is separate from resource setup.
+
+Keep local `.env` pointed at Docker. Hosted connections belong in separate ignored `.env.hosted.staging` and `.env.hosted.beta` files. Connecting MCP does not transfer local data; section 3 covers beta data migration.
 
 ## Architecture
 
@@ -12,10 +29,10 @@ Neo4j Aura Free is a rebuildable projection. A disabled/paused/unavailable graph
 
 ## 1. Create the databases
 
-1. In Neon, create a **Launch** project for beta, us-east-1, PostgreSQL 17. Set a seven-day restore window, autosuspend, and the smallest compute range suitable for the beta. Confirm those settings in the provider console; the AWS stack cannot enforce them.
+1. In Neon, create a **Launch** project for beta, us-east-1, PostgreSQL 17. Set a seven-day restore window, autosuspend, and the smallest compute range suitable for the beta. Confirm current plan support and these settings in the provider console; the AWS stack cannot enforce them.
 2. Create a **separate staging project** with synthetic data. Do not branch staging from the live member database. A free staging project is sufficient for fallback tests; production must have recovery enabled.
-3. Copy each project's pooled and direct connection strings (both require `sslmode=require`, or `verify-full`). Do not add these values to Git.
-4. Create an AuraDB Free instance near us-east-1 where offered. Save its `neo4j+s://` URI, username and generated password locally. This is for beta; staging needs no graph instance. Free instances may pause; do not add keepalive traffic.
+3. Copy each project's pooled and direct connection strings for the **same selected branch/database** (both require `sslmode=require`, or `verify-full`). Store the pooled URL as `DATABASE_URL` and the direct URL as `DIRECT_DATABASE_URL`, the exact names used by this repository. If a provider tool exports `DATABASE_URL_UNPOOLED`, map it to `DIRECT_DATABASE_URL` in the hosted file. Do not add these values to Git.
+4. Create an AuraDB Free instance near us-east-1 where offered. Save its `neo4j+s://` driver URI, username as `NEO4J_USER`, and password as `NEO4J_PASSWORD` locally. The backend targets database `neo4j`. This is for beta; staging needs no graph instance. Free instances may pause; do not add keepalive traffic. MCP tool authentication and the app's driver connection are separate setup steps; see the [Neo4j MCP quickstart](https://neo4j.com/docs/mcp/current/quickstart/).
 5. Copy `.env.hosted.example` to `.env.hosted.staging` and `.env.hosted.beta`. Fill the corresponding connections. Keep the local `.env` unchanged.
 6. Generate **two different** random secrets for each environment:
    ```sh
@@ -32,6 +49,8 @@ The files are ignored. Use the helper to upload configuration without placing pa
 ```
 
 Save the returned secret ARN. Use an IAM deployment role/SSO profile, not root credentials. The stack grants runtime Lambdas only secret read, queue access, and backup bucket writes as appropriate.
+
+For development or migration rehearsals on Neon, use an isolated branch of the synthetic staging project and a separate ignored environment file. Record both the Git branch and Neon project/branch IDs; they are separate selections. Ordinary Neon branches include their parent's data, so do not use a live-member branch for routine staging tests. Review the schema diff and apply repository migrations to the intended release database explicitly; a Git merge does not migrate it. See [Neon branching](https://neon.com/docs/introduction/branching).
 
 ## 2. Check and deploy staging
 
