@@ -1,8 +1,35 @@
 # Private beta deployment
 
-This is the first-time hosted setup guide. As of 2026-11-09, the Neon, Neo4j, GitHub, and AWS accounts have been connected to MCP through OAuth. **The hosted databases and AWS application infrastructure have not been created.** The GitHub repository and local Docker databases already exist.
+This is the first-time hosted setup guide. **As of 2026-11-10, the Neon staging and beta databases exist, and the connected Neo4j Aura database is online. Application database setup is incomplete; the hosted beta is not ready.** The GitHub repository and local Docker databases already exist. AWS application deployment remains pending in this guide and was not reverified during the database checks.
 
-The repository contains the Lambda/static-site deployment, gated native signup, and release workflows. Start by creating the managed databases in section 1, then deploy staging and prepare beta. Start with a CloudFront address; a custom domain is optional later.
+The repository contains the Lambda/static-site deployment, gated native signup, and release workflows. Complete the remaining database setup below, then deploy staging and prepare beta. Start with a CloudFront address; a custom domain is optional later.
+
+## Verified database status — 2026-11-10
+
+| Resource | Verified state | Remaining work |
+| --- | --- | --- |
+| Neon staging | `neighbor-staging`, project `cool-art-99004516`, default branch `main` / `br-rapid-feather-bc4nv25p`, database `neighborhub`; PostgreSQL 17 in `aws-us-east-1`; Free plan; zero public application tables. | Configure pooled/direct connections and run repository migrations. Use synthetic data only. |
+| Neon beta | `neighbor-beta`, project `holy-shape-80322126`, default branch `main` / `br-dark-poetry-bbktm2s8`, database `neighborhub`; PostgreSQL 17 in `aws-us-east-1`; Free plan with 21,600 seconds (six hours) of restore history; zero public application tables. | Upgrade to the guide's Launch plan and configure seven-day restore history, then configure connections, migrate schema, and migrate/reconcile beta data. |
+| Neo4j beta candidate | MCP endpoint identifies Aura instance `869db2f9`; database `neo4j` is online, empty, and has no constraints. Matching credential download names it `My instance`; this is a saved name, not a current console verification. | Verify current name, plan, cloud provider and region in Aura; verify app driver connectivity; initialize constraints and synchronize through the application workflow. |
+| Hosted configuration | `.env.hosted.beta` exists, is Git-ignored, and has mode `0600`. Matching Aura URI, `NEO4J_USER`, and password were saved from the instance's credential download. | Other beta fields remain template placeholders or defaults. `.env.hosted.staging` still needs creating. Complete both files before uploading secrets or running migrations. |
+
+The Aura driver URI is `neo4j+s://869db2f9.databases.neo4j.io`, username `neo4j`, database `neo4j`. No passwords belong in this document. The local `.env` still targets Docker. The older credential download for instance `b0b5b4c8` is a different instance and must not be substituted.
+
+The direct Python driver check failed at hostname resolution (`Cannot resolve address 869db2f9.databases.neo4j.io:7687`), before authentication could be tested. This does **not** establish that the saved password is invalid or that Aura is offline: the separate MCP connection successfully reached the database. The available Neo4j MCP tools expose database queries, not Aura account provisioning, plan or region metadata. The in-app browser failed to initialize, so console verification was unavailable.
+
+### Next steps, in order
+
+1. In the Aura console, select instance `869db2f9` and confirm its current name, status, plan/tier, cloud provider, region, and driver URI. Reuse this instance if suitable; do not create a duplicate merely because application setup is unfinished. The intended setup is AuraDB Free near us-east-1 where offered. Staging needs no graph instance.
+2. Retry the Python driver from a terminal/network that can resolve the confirmed hostname and connect to its Bolt endpoint on port 7687. Load credentials from `.env.hosted.beta`; call `verify_connectivity()` and execute `RETURN 1 AS connected` explicitly against database `neo4j`. Record success only after both pass. If DNS still fails, investigate DNS/network access and compare the URI with the console. Reset credentials only if a subsequent authentication error warrants it.
+3. Complete Neon beta plan/recovery settings and both hosted environment files using the existing projects and exact branch IDs above. Preserve the current beta Aura credentials when filling the other fields. Generate separate session/intake secrets for each environment and configure OAuth as described in section 1.
+4. Rehearse schema changes on an isolated branch of synthetic staging, then apply repository migrations to the selected staging and beta databases with `scripts/hosted.py migrate`. Verify tables and migration status. Do not copy real member data to staging.
+5. Deploy and validate staging with the graph disabled. Prepare beta data using section 3, then initialize graph constraints and drain the SQL outbox through the application's sync workflow. Do not manually seed member projections or run a destructive rebuild against an unconfirmed target.
+6. Finish hosted connection/sync checks, backups and a restore drill, and the launch acceptance checks before inviting beta members.
+
+### Information needed from the owner
+
+- For instance `869db2f9`, provide the console's current **name, status, plan/tier, cloud provider, region, and driver URI** as text or a screenshot with secrets hidden. This supplies metadata that the database MCP cannot report.
+- No password needs to be pasted into chat: the matching downloaded credentials are already saved locally. To finish the driver check, a working DNS/network path is needed. If this agent environment still cannot resolve the hostname, run the credential-loading Python check in a normal local terminal and share only its success or sanitized error. A successful MCP query alone is not an app-driver test.
 
 ## 0. Confirm account access
 
@@ -10,8 +37,8 @@ Use the connected MCP servers for supported setup operations. OAuth connects the
 
 | Service | Confirm before initial setup |
 | --- | --- |
-| Neon | Access to the intended organization, where the beta and staging projects will be created. |
-| Neo4j | Access to the intended Aura account/project, where the beta graph instance will be created. |
+| Neon | Access to the existing beta and staging projects recorded above; confirm the selected branch before writes. |
+| Neo4j | Console verification of existing instance `869db2f9`, plus a successful application driver connection. |
 | AWS | The intended AWS account, deployment role, and region for creating the application stacks. |
 | GitHub | The intended repository, current branches, and relevant PRs and checks. Follow `AGENTS.md` to avoid branch conflicts and mixing unrelated changes into commits. |
 
@@ -29,11 +56,11 @@ Neo4j Aura Free is a rebuildable projection. A disabled/paused/unavailable graph
 
 ## 1. Create the databases
 
-1. In Neon, create a **Launch** project for beta, us-east-1, PostgreSQL 17. Set a seven-day restore window, autosuspend, and the smallest compute range suitable for the beta. Confirm current plan support and these settings in the provider console; the AWS stack cannot enforce them.
-2. Create a **separate staging project** with synthetic data. Do not branch staging from the live member database. A free staging project is sufficient for fallback tests; production must have recovery enabled.
+1. Reuse the existing Neon beta project above and upgrade it to **Launch**; it already uses us-east-1 and PostgreSQL 17. Set a seven-day restore window, autosuspend, and the smallest compute range suitable for the beta. Confirm current plan support and these settings in the provider console; the AWS stack cannot enforce them.
+2. Reuse the **separate staging project** recorded above with synthetic data. Do not branch staging from the live member database. A free staging project is sufficient for fallback tests; production must have recovery enabled.
 3. Copy each project's pooled and direct connection strings for the **same selected branch/database** (both require `sslmode=require`, or `verify-full`). Store the pooled URL as `DATABASE_URL` and the direct URL as `DIRECT_DATABASE_URL`, the exact names used by this repository. If a provider tool exports `DATABASE_URL_UNPOOLED`, map it to `DIRECT_DATABASE_URL` in the hosted file. Do not add these values to Git.
-4. Create an AuraDB Free instance near us-east-1 where offered. Save its `neo4j+s://` driver URI, username as `NEO4J_USER`, and password as `NEO4J_PASSWORD` locally. The backend targets database `neo4j`. This is for beta; staging needs no graph instance. Free instances may pause; do not add keepalive traffic. MCP tool authentication and the app's driver connection are separate setup steps; see the [Neo4j MCP quickstart](https://neo4j.com/docs/mcp/current/quickstart/).
-5. Copy `.env.hosted.example` to `.env.hosted.staging` and `.env.hosted.beta`. Fill the corresponding connections. Keep the local `.env` unchanged.
+4. Verify and reuse Aura instance `869db2f9` if it meets the intended AuraDB Free setup near us-east-1 where offered. Save its `neo4j+s://` driver URI, username as `NEO4J_USER`, and password as `NEO4J_PASSWORD` locally. The backend targets database `neo4j`. This is for beta; staging needs no graph instance. Free instances may pause; do not add keepalive traffic. MCP tool authentication and the app's driver connection are separate setup steps; see the [Neo4j MCP quickstart](https://neo4j.com/docs/mcp/current/quickstart/).
+5. Copy `.env.hosted.example` only for missing hosted files. `.env.hosted.beta` already contains Aura credentials; preserve those values. Fill the corresponding connections. Keep the local `.env` unchanged.
 6. Generate **two different** random secrets for each environment:
    ```sh
    .venv/bin/python -c 'import secrets; print(secrets.token_hex(32))'
@@ -140,4 +167,4 @@ After the first hosted feedback, enable the prepared Cognito stack. It uses Esse
 
 ## Launch acceptance
 
-Start with five people on the hosted domain: ordinary login/admin denial; wrong account/pending/suspended/expired states; approved import visibility; filtering and culture opt-in; two-person request/accept/reply/retry/older pages/unread/block/report; cold DB wake; unavailable graph; queue failure/recovery; backup restore; rollback. Then expand to 10–50. These hosted and provider-specific checks remain pending until the services are created.
+Start with five people on the hosted domain: ordinary login/admin denial; wrong account/pending/suspended/expired states; approved import visibility; filtering and culture opt-in; two-person request/accept/reply/retry/older pages/unread/block/report; cold DB wake; unavailable graph; queue failure/recovery; backup restore; rollback. Then expand to 10–50. These hosted and provider-specific checks remain pending until configuration, migration, and deployment are completed.
