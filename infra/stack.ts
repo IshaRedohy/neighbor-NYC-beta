@@ -93,14 +93,12 @@ export class BetaStack extends cdk.Stack {
       name: string,
       handler: string,
       timeout: number,
-      concurrency: number,
     ) => {
       const fn = new lambda.DockerImageFunction(this, name, {
         code: image(handler),
         memorySize: 512,
         architecture: lambda.Architecture.X86_64,
         timeout: cdk.Duration.seconds(timeout),
-        reservedConcurrentExecutions: concurrency,
         environment: env,
         logGroup: new logs.LogGroup(this, name + "Logs", {
           retention: logs.RetentionDays.TWO_WEEKS,
@@ -110,10 +108,10 @@ export class BetaStack extends cdk.Stack {
       secret.grantRead(fn);
       return fn;
     };
-    const apiFunction = create("Api", "backend.lambda_handler.handler", 29, 5);
+    const apiFunction = create("Api", "backend.lambda_handler.handler", 29);
     apiFunction.addEnvironment("GRAPH_QUEUE_URL", queue.queueUrl);
     queue.grantSendMessages(apiFunction);
-    const sync = create("GraphSync", "backend.sync_lambda.handler", 120, 2);
+    const sync = create("GraphSync", "backend.sync_lambda.handler", 120);
     sync.addEventSource(
       new sources.SqsEventSource(queue, {
         batchSize: 1,
@@ -130,7 +128,7 @@ export class BetaStack extends cdk.Stack {
         }),
       ],
     });
-    const backup = create("Backup", "backend.backup_lambda.handler", 300, 1);
+    const backup = create("Backup", "backend.backup_lambda.handler", 300);
     backup.addEnvironment("BACKUP_BUCKET", backups.bucketName);
     backups.grantPut(backup);
     new events.Rule(this, "DailyBackup", {

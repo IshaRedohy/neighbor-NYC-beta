@@ -122,6 +122,12 @@ Save the returned secret ARN. Use an IAM deployment role/SSO profile, not root c
 
 For development or migration rehearsals on Neon, use an isolated branch of the synthetic staging project and a separate ignored environment file. Record both the Git branch and Neon project/branch IDs; they are separate selections. Ordinary Neon branches include their parent's data, so do not use a live-member branch for routine staging tests. Review the schema diff and apply repository migrations to the intended release database explicitly; a Git merge does not migrate it. See [Neon branching](https://neon.com/docs/introduction/branching).
 
+### Lambda concurrency on this account
+
+Staging and beta use shared, unreserved Lambda concurrency so they can deploy with the account's current 10-execution limit in us-east-1. No function sets `ReservedConcurrentExecutions`; this avoids the requirement to leave 100 executions unreserved when allocating function reservations. The SQS graph event-source mapping remains capped at two concurrent invocations. Scheduled recovery invocations are separate from that mapping limit.
+
+The account limit is shared with other applications. API calls, sync and backups may compete for capacity and experience throttling; there are no dedicated per-function capacity guarantees or per-function concurrency caps. Existing SQS retries, dead-letter queues, hourly recovery, and error alarms remain in place. Monitor throttles and backlog after deployment. An approved account quota increase provides headroom but does not automatically add function reservations or provisioned concurrency.
+
 ## 2. Check and deploy staging
 
 Required tools: Docker, Node 22+, Python 3.12, AWS CLI and a configured deployment role. CDK and dependencies are pinned in `infra/package-lock.json`.

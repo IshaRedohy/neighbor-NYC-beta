@@ -4,6 +4,20 @@ import { BetaStack, SignupStack } from "./stack";
 const app = new cdk.App({ context: { stage: "staging" } });
 const template = Template.fromStack(new BetaStack(app, "Test"));
 template.resourceCountIs("AWS::Lambda::Function", 3);
+// Low-quota accounts cannot allocate reserved concurrency. Check every function
+// in both environments so one reservation cannot block the whole deployment.
+for (const stageTemplate of [
+  template,
+  Template.fromStack(new BetaStack(new cdk.App({ context: { stage: "beta" } }), "BetaTest")),
+]) {
+  stageTemplate.allResourcesProperties("AWS::Lambda::Function", {
+    ReservedConcurrentExecutions: Match.absent(),
+  });
+  stageTemplate.hasResourceProperties("AWS::Lambda::EventSourceMapping", {
+    ScalingConfig: { MaximumConcurrency: 2 },
+  });
+}
+
 template.hasResourceProperties("AWS::Lambda::Function", {
   MemorySize: 512,
   Environment: {
