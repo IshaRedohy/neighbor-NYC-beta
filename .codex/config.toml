@@ -1,3 +1,6 @@
 [mcp_servers.Neon]
 type = "http"
 url = "https://mcp.neon.tech/mcp"
+
+[mcp_servers.neo4j]
+url = "https://869db2f9.mcp-instances.neo4j.io"
